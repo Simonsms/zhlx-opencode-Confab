@@ -1,0 +1,27 @@
+{
+  "name": "universal-onboarding-s2-reliable-lifecycle",
+  "title": "S2 重启恢复、并发、暂停与失败路径",
+  "status": "pending",
+  "task_type": "AFK",
+  "dependencies": [
+    "universal-onboarding-s1-first-connection"
+  ],
+  "goal": "使首次接入后的日常运行可持续，保证暂停不被新会话拉起、失败不串环境或重复采集。",
+  "requirement": "docs/prd/universal-onboarding.md",
+  "design": "docs/design/universal-onboarding.md",
+  "prd": ".trellis/tasks/universal-onboarding-s2-reliable-lifecycle/prd.md",
+  "scope": [
+    "packages/opencode-plugin/",
+    "pkg/onboarding/",
+    "pkg/config/",
+    "pkg/daemon/",
+    "cmd/spawn.go",
+    "cmd/integration*.go",
+    "test/portable/"
+  ],
+  "approval": {
+    "date": "2026-09-16",
+    "basis": "用户确认开发设计方案及推荐实施路线；环境地址、分发条件和实际版本仍按设计待落实。"
+  },
+  "verification_status": "not_run"
+}

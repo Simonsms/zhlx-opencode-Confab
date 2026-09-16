@@ -1,0 +1,366 @@
+package provider
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+
+	"github.com/ConfabulousDev/confab/pkg/config"
+	"github.com/ConfabulousDev/confab/pkg/hookconfig"
+	"github.com/ConfabulousDev/confab/pkg/logger"
+	"github.com/ConfabulousDev/confab/pkg/pathcanon"
+	"github.com/ConfabulousDev/confab/pkg/process"
+	"github.com/ConfabulousDev/confab/pkg/types"
+)
+
+// ClaudeStateDirEnv is the environment variable to override the default Claude state directory.
+const ClaudeStateDirEnv = "CONFAB_CLAUDE_DIR"
+
+// ClaudeCode contains Claude Code-specific local behavior. configDirOverride,
+// when non-empty, takes precedence over CONFAB_CLAUDE_DIR and the default in
+// StateDir() — it is how `confab setup --provider claude-code --config-dir
+// <dir>` retargets installation into a non-default config dir (kata hpec). The
+// zero value (ClaudeCode{}) keeps today's behavior.
+type ClaudeCode struct {
+	configDirOverride string
+}
+
+var _ Provider = ClaudeCode{}
+
+// ConfigDirFromTranscript derives the Claude config dir from a transcript
+// path. Claude writes transcripts to <configDir>/projects/<enc-cwd>/<id>.jsonl,
+// so the config dir is the directory three levels above the file — but only
+// when the path actually has that shape (absolute, and the segment two levels
+// up is literally "projects", which anchors on the LAST "projects" so a config
+// dir whose own path contains "projects" still resolves correctly). The result
+// is canonicalized so it matches a stored binding key. Returns an error when
+// the path does not have the expected layout, so callers can fall back to the
+// default binding.
+func (ClaudeCode) ConfigDirFromTranscript(transcriptPath string) (string, error) {
+	if !filepath.IsAbs(transcriptPath) {
+		return "", fmt.Errorf("transcript path %q is not absolute", transcriptPath)
+	}
+	projectsDir := filepath.Dir(filepath.Dir(transcriptPath)) // <configDir>/projects
+	if filepath.Base(projectsDir) != "projects" {
+		return "", fmt.Errorf("transcript path %q is not under a Claude projects/ directory", transcriptPath)
+	}
+	return pathcanon.CanonicalDir(filepath.Dir(projectsDir)), nil
+}
+
+// Name returns the canonical Claude Code provider name.
+func (ClaudeCode) Name() string { return NameClaudeCode }
+
+// CLIBinaryName returns "claude" — the binary `claude` users install via
+// the Claude Code installer.
+func (ClaudeCode) CLIBinaryName() string { return "claude" }
+
+// SupportsCommitLinking reports that Claude Code installs PreToolUse +
+// PostToolUse hooks that drive bidirectional GitHub linking.
+func (ClaudeCode) SupportsCommitLinking() bool { return true }
+
+// ParseSessionHook reads a Claude SessionStart hook payload and returns
+// the provider-agnostic view.
+func (p ClaudeCode) ParseSessionHook(r io.Reader) (HookInput, error) {
+	in, err := p.ReadSessionHookInput(r)
+	if err != nil {
+		return nil, err
+	}
+	return claudeHookInputAdapter{inner: in}, nil
+}
+
+// WalkUpToRoot is the identity walk for Claude Code: there is no thread
+// tree, so the firing session is always its own root and rootPath is "".
+func (ClaudeCode) WalkUpToRoot(sessionID string) (string, string, error) {
+	return sessionID, "", nil
+}
+
+// ShouldSpawnForInput is unconditional for Claude Code.
+func (ClaudeCode) ShouldSpawnForInput(HookInput) bool { return true }
+
+// InstallHooks installs all four Confab hook bundles (sync, PreToolUse,
+// PostToolUse, UserPromptSubmit). Returns the settings.json path.
+func (p ClaudeCode) InstallHooks() (string, error) {
+	settingsPath, err := p.SettingsPath()
+	if err != nil {
+		return "", err
+	}
+	installers := []func(string) error{
+		hookconfig.InstallSyncHooks,
+		hookconfig.InstallPreToolUseHooks,
+		hookconfig.InstallPostToolUseHooks,
+		hookconfig.InstallUserPromptSubmitHook,
+	}
+	for _, install := range installers {
+		if err := install(settingsPath); err != nil {
+			return "", err
+		}
+	}
+	return settingsPath, nil
+}
+
+// UninstallHooks removes all four Confab hook bundles. Returns the
+// settings.json path even if no hooks were present.
+func (p ClaudeCode) UninstallHooks() (string, error) {
+	settingsPath, err := p.SettingsPath()
+	if err != nil {
+		return "", err
+	}
+	uninstallers := []func(string) error{
+		hookconfig.UninstallSyncHooks,
+		hookconfig.UninstallPreToolUseHooks,
+		hookconfig.UninstallPostToolUseHooks,
+		hookconfig.UninstallUserPromptSubmitHook,
+	}
+	for _, uninstall := range uninstallers {
+		if err := uninstall(settingsPath); err != nil {
+			return "", err
+		}
+	}
+	return settingsPath, nil
+}
+
+// InstallSkills installs the Claude Code skills shipped with confab (/retro)
+// and prunes any retired skills left by older versions.
+func (p ClaudeCode) InstallSkills() error {
+	stateDir, err := p.StateDir()
+	if err != nil {
+		return err
+	}
+	return config.ReconcileBundledSkills(stateDir, config.SkillProviderClaude)
+}
+
+// UninstallSkills removes the Claude Code skills shipped with confab.
+func (p ClaudeCode) UninstallSkills() error {
+	stateDir, err := p.StateDir()
+	if err != nil {
+		return err
+	}
+	return config.UninstallBundledSkills(stateDir)
+}
+
+// IsSkillInstalled reports whether a shipped Claude Code skill exists.
+func (p ClaudeCode) IsSkillInstalled(name string) bool {
+	stateDir, err := p.StateDir()
+	if err != nil {
+		return false
+	}
+	return config.IsBundledSkillInstalled(stateDir, name)
+}
+
+// WriteHookResponse writes a ClaudeHookResponse to w.
+func (ClaudeCode) WriteHookResponse(w io.Writer, suppressOutput bool, systemMessage string) error {
+	return json.NewEncoder(w).Encode(types.ClaudeHookResponse{
+		Continue:       true,
+		SuppressOutput: suppressOutput,
+		SystemMessage:  systemMessage,
+	})
+}
+
+// InitTranscript is a no-op for Claude Code — there is no root rollout
+// metadata to attach (Codex-only concern).
+func (ClaudeCode) InitTranscript(TranscriptRegistrar, string, string) error { return nil }
+
+// DiscoverDescendants is a no-op for Claude Code. Claude's agent files are
+// discovered transitively from transcript content (agent IDs embedded in
+// JSONL messages) inside tracker.DiscoverNewFiles — no external state DB
+// lookup is required.
+func (ClaudeCode) DiscoverDescendants(DescendantRegistrar, string) error { return nil }
+
+// AnnotateChunk extracts the local summary, first user message, and
+// summary-link records from a Claude Code transcript chunk. Summary links
+// are returned via AnnotationResult.SummaryLinks so the engine can perform
+// the backend HTTP after AnnotateChunk returns — keeping the provider
+// side-effect-free.
+//
+// Non-transcript files are a no-op (Claude extracts only from transcripts).
+//
+// Claude does not gate first-user-message extraction on a "first time"
+// flag — the discovery helper handles dedup internally and the engine
+// historically does not flip sentFirstUserMessage for Claude. The returned
+// IncludedFirstUserMessage stays false so the engine's flag is untouched.
+func (p ClaudeCode) AnnotateChunk(c ChunkView, _ bool, redact func(string) string) AnnotationResult {
+	if c.FileType() != "transcript" {
+		return AnnotationResult{}
+	}
+	meta := p.ExtractMetadata(c.Lines())
+	summary := meta.Summary
+	firstUserMessage := meta.FirstUserMessage
+	if redact != nil {
+		summary = redact(summary)
+		firstUserMessage = redact(firstUserMessage)
+	}
+	c.SetSummary(summary)
+	c.SetFirstUserMessage(firstUserMessage)
+
+	return AnnotationResult{SummaryLinks: meta.SummaryLinks}
+}
+
+// DefaultCWD returns filepath.Dir(transcriptPath); Claude has no richer
+// per-session CWD source.
+// OnAlreadyRunning is a no-op for Claude Code: hook deduplication is the
+// normal path (Claude fires SessionStart on every turn). See Provider
+// interface doc for the OpenCode-specific behavior.
+func (ClaudeCode) OnAlreadyRunning(string) {}
+
+func (p ClaudeCode) DefaultCWD(transcriptPath string) string {
+	return filepath.Dir(transcriptPath)
+}
+
+// IsHooksInstalled reports whether all four Confab hook bundles for
+// Claude Code are installed. Mirrors InstallHooks: true only when every
+// bundle is present.
+func (p ClaudeCode) IsHooksInstalled() (bool, error) {
+	settingsPath, err := p.SettingsPath()
+	if err != nil {
+		return false, err
+	}
+	checks := []func(string) (bool, error){
+		hookconfig.IsSyncHooksInstalled,
+		hookconfig.IsPreToolUseHooksInstalled,
+		hookconfig.IsPostToolUseHooksInstalled,
+		hookconfig.IsUserPromptSubmitHookInstalled,
+	}
+	for _, check := range checks {
+		ok, err := check(settingsPath)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// StateDir returns the Claude config/install directory. Precedence:
+// configDirOverride (set via GetWithDir for `setup --config-dir`) > the
+// CONFAB_CLAUDE_DIR env var > the default ~/.claude.
+func (p ClaudeCode) StateDir() (string, error) {
+	if p.configDirOverride != "" {
+		return p.configDirOverride, nil
+	}
+	if envDir := os.Getenv(ClaudeStateDirEnv); envDir != "" {
+		return envDir, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	return filepath.Join(home, ".claude"), nil
+}
+
+// ProjectsDir returns the Claude projects directory.
+func (p ClaudeCode) ProjectsDir() (string, error) {
+	stateDir, err := p.StateDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get claude state directory: %w", err)
+	}
+	return filepath.Join(stateDir, "projects"), nil
+}
+
+// SettingsPath returns the Claude settings file path.
+func (p ClaudeCode) SettingsPath() (string, error) {
+	stateDir, err := p.StateDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get claude state directory: %w", err)
+	}
+	return filepath.Join(stateDir, "settings.json"), nil
+}
+
+// ReadHookInput reads and validates Claude hook JSON.
+func (ClaudeCode) ReadHookInput(r io.Reader) (*types.ClaudeHookInput, error) {
+	return types.ReadClaudeHookInput(r)
+}
+
+// ReadSessionHookInput reads Claude session hook JSON and validates transcript_path.
+func (p ClaudeCode) ReadSessionHookInput(r io.Reader) (*types.ClaudeHookInput, error) {
+	input, err := p.ReadHookInput(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if input.TranscriptPath == "" {
+		return nil, fmt.Errorf("transcript_path is required")
+	}
+
+	if err := p.ValidateTranscriptPath(input.TranscriptPath); err != nil {
+		return nil, fmt.Errorf("invalid transcript_path: %w", err)
+	}
+
+	return input, nil
+}
+
+// ValidateTranscriptPath checks that a Claude transcript path is safe:
+// - Must be absolute
+// - Must not contain ".." components
+// - Must resolve to a location under the Claude projects directory
+func (p ClaudeCode) ValidateTranscriptPath(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("must be an absolute path")
+	}
+
+	cleaned := filepath.Clean(path)
+	if hasDotDotComponent(cleaned) {
+		return fmt.Errorf("must not contain '..' components")
+	}
+
+	projectsDir, err := p.ProjectsDir()
+	if err != nil {
+		return err
+	}
+
+	allowedRoots := []string{projectsDir}
+	if envDir := os.Getenv(ClaudeStateDirEnv); envDir != "" {
+		// Preserve legacy validation behavior: older code treated CONFAB_CLAUDE_DIR
+		// itself as the allowed transcript root for hook payloads.
+		allowedRoots = append(allowedRoots, envDir)
+	}
+
+	if pathIsUnderAnyRoot(cleaned, allowedRoots) {
+		return nil
+	}
+	return fmt.Errorf("must be under Claude projects directory (%s)", projectsDir)
+}
+
+// FindParentPID walks up the process tree to find the Claude Code process.
+func (p ClaudeCode) FindParentPID() int {
+	return findParentOrGrandparent(p.IsProcess, "Claude")
+}
+
+// IsProcess checks if the given PID is a Claude Code process.
+func (p ClaudeCode) IsProcess(pid int) bool {
+	return p.MatchesProcess(process.Cmdline(pid))
+}
+
+var claudeProcessPattern = regexp.MustCompile(`(?i)\bclaude\b`)
+
+// MatchesProcess checks if a command string matches Claude Code.
+func (ClaudeCode) MatchesProcess(cmd string) bool {
+	return claudeProcessPattern.MatchString(cmd)
+}
+
+// findParentOrGrandparent walks up to two levels of the process tree looking
+// for a process satisfying isProcess. Shared by each provider's FindParentPID
+// for daemon parent-liveness monitoring. If label is non-empty, a Warn is
+// logged when neither the parent nor grandparent matches.
+func findParentOrGrandparent(isProcess func(int) bool, label string) int {
+	parentPID := os.Getppid()
+	if isProcess(parentPID) {
+		return parentPID
+	}
+
+	grandparentPID := process.ParentPID(parentPID)
+	if grandparentPID > 0 && isProcess(grandparentPID) {
+		return grandparentPID
+	}
+
+	if label != "" {
+		logger.Warn("Could not find %s in process tree, disabling parent PID monitoring", label)
+	}
+	return 0
+}

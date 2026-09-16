@@ -1,0 +1,24 @@
+{
+  "name": "universal-onboarding-s5-intranet-delivery",
+  "title": "S5 内网分发与部署验收",
+  "status": "pending",
+  "task_type": "HITL",
+  "dependencies": [
+    "universal-onboarding-s4-external-acceptance"
+  ],
+  "goal": "根据真实内网条件制作私服或自包含离线产物，在禁止公网访问的环境中完成接入验收。",
+  "requirement": "docs/prd/universal-onboarding.md",
+  "design": "docs/design/universal-onboarding.md",
+  "prd": ".trellis/tasks/universal-onboarding-s5-intranet-delivery/prd.md",
+  "scope": [
+    "packages/opencode-plugin/",
+    "scripts/",
+    "deployment presets",
+    "docs/handoff/universal-onboarding/"
+  ],
+  "approval": {
+    "date": "2026-09-16",
+    "basis": "用户确认开发设计方案及推荐实施路线；环境地址、分发条件和实际版本仍按设计待落实。"
+  },
+  "verification_status": "not_run"
+}

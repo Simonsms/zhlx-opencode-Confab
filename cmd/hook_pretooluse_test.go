@@ -1,0 +1,1095 @@
+package cmd
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ConfabulousDev/confab/pkg/config"
+	"github.com/ConfabulousDev/confab/pkg/daemon"
+	"github.com/ConfabulousDev/confab/pkg/types"
+)
+
+// testBackendURL is the backend URL used in tests
+const testBackendURL = "https://test.example.com"
+
+// setupTestState creates a daemon state file for testing and returns a cleanup function.
+// It creates the state in a temp directory by overriding HOME.
+// Also creates a config file with a test backend URL.
+func setupTestState(t *testing.T, claudeSessionID, confabSessionID string) func() {
+	t.Helper()
+
+	// Create temp home directory
+	tempHome, err := os.MkdirTemp("", "confab-test-home-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp home: %v", err)
+	}
+
+	// Save original HOME and set new one
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+
+	// Create state directory
+	stateDir := filepath.Join(tempHome, ".confab", "sync")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("Failed to create state dir: %v", err)
+	}
+
+	// Create config with backend URL
+	cfg := &config.UploadConfig{
+		BackendURL: testBackendURL,
+		APIKey:     "cfb_test_key_for_testing_purposes_only",
+	}
+	if err := config.SaveUploadConfig(cfg); err != nil {
+		t.Fatalf("Failed to save test config: %v", err)
+	}
+
+	// Create state with ConfabSessionID
+	state := daemon.NewStateForProvider("", claudeSessionID, "/fake/transcript.jsonl", "/fake/cwd", 0)
+	state.ConfabSessionID = confabSessionID
+	if err := state.Save(); err != nil {
+		t.Fatalf("Failed to save test state: %v", err)
+	}
+
+	// Return cleanup function
+	return func() {
+		os.Setenv("HOME", origHome)
+		os.RemoveAll(tempHome)
+	}
+}
+
+func TestFindGitCommitPosition(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    int // -1 means not found, >= 0 means found at position
+	}{
+		{"simple git commit", "git commit -m 'test'", 0},
+		{"git commit with flags", "git commit -am 'test'", 0},
+		{"chained git add and commit", "git add . && git commit -m 'test'", 13},
+		{"git commit with heredoc", "git commit -m \"$(cat <<'EOF'\ntest\nEOF\n)\"", 0},
+		{"git status", "git status", -1},
+		{"git push", "git push origin main", -1},
+		{"npm install", "npm install", -1},
+		{"empty command", "", -1},
+		{"git log", "git log --oneline", -1},
+		{"git diff", "git diff HEAD", -1},
+		{"git with -C flag", "git -C /some/path commit -m 'test'", 0},
+		{"git with multiple flags", "git --no-pager -C /path commit -m 'test'", 0},
+		{"git with config flag", "git -c user.name=test commit -m 'test'", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := firstMatch(gitCommitPattern, tt.command)
+			if tt.want < 0 && got >= 0 {
+				t.Errorf("firstMatch(gitCommitPattern, %q) = %d, want not found", tt.command, got)
+			} else if tt.want >= 0 && got < 0 {
+				t.Errorf("firstMatch(gitCommitPattern, %q) = not found, want %d", tt.command, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindGitPushPosition(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    int // -1 means not found, >= 0 means found at position
+	}{
+		{"simple git push", "git push", 0},
+		{"git push origin main", "git push origin main", 0},
+		{"git push with flags", "git push -u origin main", 0},
+		{"git push force", "git push --force", 0},
+		{"chained commit and push", "git commit -m 'test' && git push", 25},
+		{"git status", "git status", -1},
+		{"git commit", "git commit -m 'test'", -1},
+		{"npm install", "npm install", -1},
+		{"empty command", "", -1},
+		{"git with -C flag", "git -C /some/path push origin main", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := firstMatch(gitPushPattern, tt.command)
+			if tt.want < 0 && got >= 0 {
+				t.Errorf("firstMatch(gitPushPattern, %q) = %d, want not found", tt.command, got)
+			} else if tt.want >= 0 && got < 0 {
+				t.Errorf("firstMatch(gitPushPattern, %q) = not found, want %d", tt.command, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainsSessionURL(t *testing.T) {
+	sessionID := "abc123"
+
+	// Set up temp home with config
+	tempHome, err := os.MkdirTemp("", "confab-test-home-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp home: %v", err)
+	}
+	defer os.RemoveAll(tempHome)
+
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", origHome)
+
+	// Create config with backend URL
+	cfg := &config.UploadConfig{
+		BackendURL: testBackendURL,
+		APIKey:     "cfb_test_key_for_testing_purposes_only",
+	}
+	if err := config.SaveUploadConfig(cfg); err != nil {
+		t.Fatalf("Failed to save test config: %v", err)
+	}
+
+	sessionURL, err := formatSessionURL(sessionID, testBackendURL)
+	if err != nil {
+		t.Fatalf("formatSessionURL() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{
+			name:    "has session URL in commit",
+			command: `git commit -m "Fix bug\n\nConfab-Link: ` + sessionURL + `"`,
+			want:    true,
+		},
+		{
+			name:    "has session URL in PR",
+			command: `gh pr create --title "Fix" --body "📝 [Confab link](` + sessionURL + `)"`,
+			want:    true,
+		},
+		{
+			name:    "no URL",
+			command: `git commit -m "Fix bug"`,
+			want:    false,
+		},
+		{
+			name:    "wrong session ID",
+			command: `git commit -m "Fix bug\n\nConfab-Link: ` + testBackendURL + `/sessions/xyz789"`,
+			want:    false,
+		},
+		{
+			name:    "URL in heredoc",
+			command: "git commit -m \"$(cat <<'EOF'\nFix bug\n\nConfab-Link: " + sessionURL + "\nEOF\n)\"",
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsSessionURL(tt.command, sessionID, testBackendURL)
+			if got != tt.want {
+				t.Errorf("containsSessionURL(%q, %q) = %v, want %v", tt.command, sessionID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatSessionURL(t *testing.T) {
+	// Set up temp home with config
+	tempHome, err := os.MkdirTemp("", "confab-test-home-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp home: %v", err)
+	}
+	defer os.RemoveAll(tempHome)
+
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", origHome)
+
+	// Create config with backend URL
+	cfg := &config.UploadConfig{
+		BackendURL: "https://my-backend.example.com",
+		APIKey:     "cfb_test_key_for_testing_purposes_only",
+	}
+	if err := config.SaveUploadConfig(cfg); err != nil {
+		t.Fatalf("Failed to save test config: %v", err)
+	}
+
+	got, err := formatSessionURL("test-session-123", "https://my-backend.example.com")
+	if err != nil {
+		t.Fatalf("formatSessionURL() error = %v", err)
+	}
+	want := "https://my-backend.example.com/sessions/test-session-123"
+	if got != want {
+		t.Errorf("formatSessionURL() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatTrailerLine(t *testing.T) {
+	got := formatTrailerLine("https://example.com/sessions/abc123")
+	want := "Confab-Link: https://example.com/sessions/abc123"
+	if got != want {
+		t.Errorf("formatTrailerLine() = %q, want %q", got, want)
+	}
+}
+
+func TestHandlePreToolUse_NonBashTool(t *testing.T) {
+	input := types.ClaudeHookInput{
+		SessionID:     "test-session",
+		HookEventName: "PreToolUse",
+		ToolName:      "Read",
+		ToolInput:     map[string]any{"file_path": "/test.txt"},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should produce no output (silent allow)
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output for non-Bash tool, got %q", w.String())
+	}
+}
+
+func TestHandlePreToolUse_NonGitCommand(t *testing.T) {
+	input := types.ClaudeHookInput{
+		SessionID:     "test-session",
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": "npm install"},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should produce no output (silent allow)
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output for non-git command, got %q", w.String())
+	}
+}
+
+func TestHandlePreToolUse_GitCommitWithoutTrailer(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": "git commit -m 'Fix bug'"},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output deny response
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Errorf("Expected permissionDecision 'deny', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+	if !strings.Contains(response.HookSpecificOutput.PermissionDecisionReason, "Confab-Link:") {
+		t.Errorf("Expected reason to contain trailer instruction, got %q", response.HookSpecificOutput.PermissionDecisionReason)
+	}
+	// Verify the URL uses the Confab session ID, not Claude session ID
+	if !strings.Contains(response.HookSpecificOutput.PermissionDecisionReason, confabSessionID) {
+		t.Errorf("Expected reason to contain Confab session ID %q, got %q", confabSessionID, response.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_GitCommitWithTrailer(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID (must be before formatSessionURL)
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	sessionURL, err := formatSessionURL(confabSessionID, testBackendURL)
+	if err != nil {
+		t.Fatalf("formatSessionURL() error = %v", err)
+	}
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput: map[string]any{
+			"command": "git commit -m \"Fix bug\n\nConfab-Link: " + sessionURL + "\"",
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err = handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output allow response
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Errorf("Expected permissionDecision 'allow', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestHandlePreToolUse_GitCommitNoState(t *testing.T) {
+	// When there's no daemon state (sync not set up), commits should be allowed silently
+	input := types.ClaudeHookInput{
+		SessionID:     "unknown-session",
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": "git commit -m 'Fix bug'"},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should produce no output (silent allow) when no state exists
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output when no state exists, got %q", w.String())
+	}
+}
+
+func TestHandlePreToolUse_InvalidJSON(t *testing.T) {
+	r := strings.NewReader("not valid json")
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error (silent failure), got %v", err)
+	}
+
+	// Should produce no output on parse error (silent allow)
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output on parse error, got %q", w.String())
+	}
+}
+
+func TestHandlePreToolUse_MissingSessionID(t *testing.T) {
+	input := types.ClaudeHookInput{
+		SessionID:     "", // Missing
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": "git commit -m 'test'"},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error (silent failure), got %v", err)
+	}
+
+	// Should produce no output on validation error (silent allow)
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output on validation error, got %q", w.String())
+	}
+}
+
+// --- PR Creation Tests ---
+
+func TestFindGHPRCreatePosition(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    int // -1 means not found, >= 0 means found at position
+	}{
+		{"simple gh pr create", "gh pr create", 0},
+		{"gh pr create with title", "gh pr create --title 'Fix bug'", 0},
+		{"gh pr create with body", `gh pr create --title "test" --body "description"`, 0},
+		{"gh pr create with heredoc", "gh pr create --title \"test\" --body \"$(cat <<'EOF'\ndescription\nEOF\n)\"", 0},
+		{"gh pr list", "gh pr list", -1},
+		{"gh pr view", "gh pr view 123", -1},
+		{"git push", "git push origin main", -1},
+		{"npm install", "npm install", -1},
+		{"empty command", "", -1},
+		{"gh with -R flag", "gh -R owner/repo pr create --title 'test'", 0},
+		{"gh with multiple flags", "gh --no-pager -R owner/repo pr create", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := firstMatch(ghPRCreatePattern, tt.command)
+			if tt.want < 0 && got >= 0 {
+				t.Errorf("firstMatch(ghPRCreatePattern, %q) = %d, want not found", tt.command, got)
+			} else if tt.want >= 0 && got < 0 {
+				t.Errorf("firstMatch(ghPRCreatePattern, %q) = not found, want %d", tt.command, tt.want)
+			}
+		})
+	}
+}
+
+// TestPositionBasedPrecedence tests that the earlier matching command takes precedence.
+// This fixes false positives where "gh pr create" text in a commit message would
+// incorrectly trigger PR handling.
+func TestPositionBasedPrecedence(t *testing.T) {
+	tests := []struct {
+		name         string
+		command      string
+		wantCommit   bool
+		wantPRCreate bool
+	}{
+		{
+			name:         "git commit with PR text in message",
+			command:      `git commit -m "Add detection for gh pr create"`,
+			wantCommit:   true,
+			wantPRCreate: false,
+		},
+		{
+			name:         "git commit mentioning PR in heredoc",
+			command:      "git commit -m \"$(cat <<'EOF'\nAdd gh pr create handling\nEOF\n)\"",
+			wantCommit:   true,
+			wantPRCreate: false,
+		},
+		{
+			name:         "simple git commit",
+			command:      `git commit -m "Fix bug"`,
+			wantCommit:   true,
+			wantPRCreate: false,
+		},
+		{
+			name:         "simple gh pr create",
+			command:      `gh pr create --title "test"`,
+			wantCommit:   false,
+			wantPRCreate: true,
+		},
+		{
+			name:         "gh pr create mentioning commit",
+			command:      `gh pr create --title "git commit changes"`,
+			wantCommit:   false,
+			wantPRCreate: true,
+		},
+		{
+			name:         "neither command",
+			command:      `npm install`,
+			wantCommit:   false,
+			wantPRCreate: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			commitPos := firstMatch(gitCommitPattern, tt.command)
+			prCreatePos := firstMatch(ghPRCreatePattern, tt.command)
+
+			isCommit := commitPos >= 0 && (prCreatePos < 0 || commitPos < prCreatePos)
+			isPRCreate := prCreatePos >= 0 && (commitPos < 0 || prCreatePos < commitPos)
+
+			if isCommit != tt.wantCommit {
+				t.Errorf("isCommit = %v, want %v (commitPos=%d, prCreatePos=%d)",
+					isCommit, tt.wantCommit, commitPos, prCreatePos)
+			}
+			if isPRCreate != tt.wantPRCreate {
+				t.Errorf("isPRCreate = %v, want %v (commitPos=%d, prCreatePos=%d)",
+					isPRCreate, tt.wantPRCreate, commitPos, prCreatePos)
+			}
+		})
+	}
+}
+
+func TestFormatPRLink(t *testing.T) {
+	got := formatPRLink("https://example.com/sessions/abc123")
+	want := "📝 [Confab link](https://example.com/sessions/abc123)"
+	if got != want {
+		t.Errorf("formatPRLink() = %q, want %q", got, want)
+	}
+}
+
+func TestHandlePreToolUse_PRCreateWithoutLink(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": `gh pr create --title "Fix bug" --body "Just a description"`},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output deny response
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Errorf("Expected permissionDecision 'deny', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+	if !strings.Contains(response.HookSpecificOutput.PermissionDecisionReason, "Confab link") {
+		t.Errorf("Expected reason to contain PR link instruction, got %q", response.HookSpecificOutput.PermissionDecisionReason)
+	}
+	// Verify the URL uses the Confab session ID
+	if !strings.Contains(response.HookSpecificOutput.PermissionDecisionReason, confabSessionID) {
+		t.Errorf("Expected reason to contain Confab session ID %q, got %q", confabSessionID, response.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_PRCreateWithLink(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID (must be before formatSessionURL)
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	sessionURL, err := formatSessionURL(confabSessionID, testBackendURL)
+	if err != nil {
+		t.Fatalf("formatSessionURL() error = %v", err)
+	}
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput: map[string]any{
+			"command": `gh pr create --title "Fix bug" --body "Summary\n\n📝 [Confab link](` + sessionURL + `)"`,
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err = handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output allow response
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Errorf("Expected permissionDecision 'allow', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestHandlePreToolUse_PRCreateNoState(t *testing.T) {
+	// When there's no daemon state (sync not set up), PR creation should be allowed silently
+	input := types.ClaudeHookInput{
+		SessionID:     "unknown-session",
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": `gh pr create --title "Fix bug"`},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should produce no output (silent allow) when no state exists
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output when no state exists, got %q", w.String())
+	}
+}
+
+// --- MCP GitHub Tool Tests ---
+
+func TestHandlePreToolUse_MCPGitHubPRWithoutLink(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameMCPGitHubCreatePR,
+		ToolInput: map[string]any{
+			"owner": "myorg",
+			"repo":  "myrepo",
+			"title": "Fix bug",
+			"body":  "This PR fixes a bug",
+			"head":  "feature-branch",
+			"base":  "main",
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output deny response
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Errorf("Expected permissionDecision 'deny', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+	if !strings.Contains(response.HookSpecificOutput.PermissionDecisionReason, "Confab link") {
+		t.Errorf("Expected reason to contain PR link instruction, got %q", response.HookSpecificOutput.PermissionDecisionReason)
+	}
+	if !strings.Contains(response.HookSpecificOutput.PermissionDecisionReason, confabSessionID) {
+		t.Errorf("Expected reason to contain Confab session ID %q, got %q", confabSessionID, response.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_MCPGitHubPRWithLink(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID (must be before formatSessionURL)
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	sessionURL, err := formatSessionURL(confabSessionID, testBackendURL)
+	if err != nil {
+		t.Fatalf("formatSessionURL() error = %v", err)
+	}
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameMCPGitHubCreatePR,
+		ToolInput: map[string]any{
+			"owner": "myorg",
+			"repo":  "myrepo",
+			"title": "Fix bug",
+			"body":  "This PR fixes a bug\n\n📝 [Confab link](" + sessionURL + ")",
+			"head":  "feature-branch",
+			"base":  "main",
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err = handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output allow response
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Errorf("Expected permissionDecision 'allow', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestHandlePreToolUse_MCPGitHubPRNoState(t *testing.T) {
+	// When there's no daemon state, MCP PR creation should be allowed silently
+	input := types.ClaudeHookInput{
+		SessionID:     "unknown-session",
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameMCPGitHubCreatePR,
+		ToolInput: map[string]any{
+			"owner": "myorg",
+			"repo":  "myrepo",
+			"title": "Fix bug",
+			"body":  "Description",
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should produce no output (silent allow) when no state exists
+	if w.Len() != 0 {
+		t.Errorf("Expected empty output when no state exists, got %q", w.String())
+	}
+}
+
+func TestHandlePreToolUse_MCPGitHubPRNoBody(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	// Set up test state with Confab session ID
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	// MCP tool call without body field - should still request link
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameMCPGitHubCreatePR,
+		ToolInput: map[string]any{
+			"owner": "myorg",
+			"repo":  "myrepo",
+			"title": "Fix bug",
+			"head":  "feature-branch",
+			"base":  "main",
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	// Should output deny response requesting the link be added
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Errorf("Expected permissionDecision 'deny', got %q", response.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+// --- Certification marker tests ---
+
+func TestHandlePreToolUse_PRCreateWithMarker(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput: map[string]any{
+			"command": `gh pr create --title "Fix bug" --body-file /tmp/pr-body.md  # confab-linked-a3f9`,
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Errorf("Expected 'allow' with # confab-linked marker, got %q (reason: %s)",
+			response.HookSpecificOutput.PermissionDecision,
+			response.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_GitCommitWithMarker(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput: map[string]any{
+			"command": `git commit -F /tmp/commit-msg.txt  # confab-linked-a3f9`,
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Errorf("Expected 'allow' with # confab-linked marker, got %q (reason: %s)",
+			response.HookSpecificOutput.PermissionDecision,
+			response.HookSpecificOutput.PermissionDecisionReason)
+	}
+}
+
+func TestHandlePreToolUse_MarkerWithoutSpaceNotAccepted(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	// #confab-linked (no space) must NOT be accepted as the marker
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput: map[string]any{
+			"command": `gh pr create --title "Fix" --body "desc" #confab-linked`,
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	err := handlePreToolUse(r, &w)
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Errorf("Expected 'deny' for #confab-linked without space, got %q",
+			response.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestConfabLinkedMarker_MintedMarkerRoundTrips(t *testing.T) {
+	// The deny invocation mints a marker; a separate verify invocation must
+	// accept it via shape match. Exercise that round trip for a batch of
+	// freshly minted markers (the suffix is random).
+	for range 100 {
+		marker := newConfabLinkedMarker()
+		cmd := `gh pr create --body-file b.md  ` + marker
+		if !commandContainsConfabLink(cmd, "any-session", testBackendURL) {
+			t.Fatalf("minted marker %q not recognized by commandContainsConfabLink", marker)
+		}
+	}
+}
+
+func TestConfabLinkedMarker_NonMarkersNotMatched(t *testing.T) {
+	for _, cmd := range []string{
+		`gh pr create --body "see # confab-linked for details"`,      // bare prefix, no token
+		`gh pr create --body "use # confab-linked-<token>"`,          // non-hex placeholder
+		`gh pr create --body "#confab-linked-a3f9"`,                  // missing space inside the prefix
+		`gh pr create --body "# confab-linked-A3F9"`,                 // uppercase hex not accepted
+		`gh pr create --body "# confab-linked-deadbeef in the docs"`, // longer hex run must not match on its first 4
+	} {
+		if commandContainsConfabLink(cmd, "any-session", testBackendURL) {
+			t.Errorf("expected no certification match for %q", cmd)
+		}
+	}
+}
+
+func TestHandlePreToolUse_BareMarkerWithoutTokenNotAccepted(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	// A bare "# confab-linked" with no random token must NOT certify — this is
+	// what guards against an incidental mention of the marker in a PR body (e.g.
+	// docs describing the marker) suppressing link injection.
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput: map[string]any{
+			"command": `gh pr create --title "Fix" --body "see # confab-linked for details"`,
+		},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	if err := handlePreToolUse(r, &w); err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	if response.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Errorf("Expected 'deny' for bare '# confab-linked' without token, got %q",
+			response.HookSpecificOutput.PermissionDecision)
+	}
+}
+
+func TestHandlePreToolUse_PRDenyMessageIncludesMarkerOption(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": `gh pr create --title "Fix" --body "no link"`},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	_ = handlePreToolUse(r, &w)
+
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	reason := response.HookSpecificOutput.PermissionDecisionReason
+	// The marker the deny message tells the AI to append must be one the verify
+	// check would actually accept — otherwise the AI copies a marker the hook
+	// then rejects. Assert the reason carries a properly-shaped marker.
+	if !confabLinkedMarkerPattern.MatchString(reason) {
+		t.Errorf("PR deny reason should include a verifiable '# confab-linked-<token>' marker, got: %q", reason)
+	}
+	if !strings.Contains(reason, "Confab link") {
+		t.Errorf("PR deny reason should still mention the Confab link line, got: %q", reason)
+	}
+}
+
+func TestHandlePreToolUse_CommitDenyMessageIncludesMarkerOption(t *testing.T) {
+	claudeSessionID := "claude-session-123"
+	confabSessionID := "confab-session-456"
+
+	cleanup := setupTestState(t, claudeSessionID, confabSessionID)
+	defer cleanup()
+
+	input := types.ClaudeHookInput{
+		SessionID:     claudeSessionID,
+		HookEventName: "PreToolUse",
+		ToolName:      config.ToolNameBash,
+		ToolInput:     map[string]any{"command": `git commit -m "Fix bug with no trailer"`},
+	}
+
+	inputJSON, _ := json.Marshal(input)
+	r := strings.NewReader(string(inputJSON))
+	var w bytes.Buffer
+
+	_ = handlePreToolUse(r, &w)
+
+	var response types.PreToolUseResponse
+	if err := json.Unmarshal(w.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.HookSpecificOutput == nil {
+		t.Fatal("Expected hookSpecificOutput, got nil")
+	}
+	reason := response.HookSpecificOutput.PermissionDecisionReason
+	// The marker the deny message tells the AI to append must be one the verify
+	// check would actually accept (see the PR-path test for the rationale).
+	if !confabLinkedMarkerPattern.MatchString(reason) {
+		t.Errorf("Commit deny reason should include a verifiable '# confab-linked-<token>' marker, got: %q", reason)
+	}
+	if !strings.Contains(reason, "Confab-Link:") {
+		t.Errorf("Commit deny reason should still mention the Confab-Link: trailer, got: %q", reason)
+	}
+}

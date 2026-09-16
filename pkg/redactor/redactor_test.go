@@ -1,0 +1,1141 @@
+package redactor
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ConfabulousDev/confab/pkg/config"
+)
+
+type Config struct {
+	Patterns []Pattern
+}
+
+// TestRedactSimplePattern tests redacting with a simple pattern (full match)
+func TestRedactSimplePattern(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Single API key",
+			input:    "My API key is sk-1234567890",
+			expected: "My API key is [REDACTED:API_KEY]",
+		},
+		{
+			name:     "Multiple API keys",
+			input:    "Keys: sk-abcdefghij and sk-0987654321",
+			expected: "Keys: [REDACTED:API_KEY] and [REDACTED:API_KEY]",
+		},
+		{
+			name:     "No match",
+			input:    "This has no secrets",
+			expected: "This has no secrets",
+		},
+		{
+			name:     "Partial match should not redact",
+			input:    "sk-short",
+			expected: "sk-short",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := redactor.Redact(tt.input)
+			if result != tt.expected {
+				t.Errorf("Expected:\n%s\nGot:\n%s", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestRedactWithCaptureGroup tests partial redaction using capture groups
+func TestRedactWithCaptureGroup(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:         "PostgreSQL Password",
+				Pattern:      `(postgres://[^:]+:)([^@\s]+)(@[^\s]+)`,
+				Type:         "password",
+				CaptureGroup: 2,
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "PostgreSQL connection string",
+			input:    "postgres://user:mypassword@localhost:5432/db",
+			expected: "postgres://user:[REDACTED:PASSWORD]@localhost:5432/db",
+		},
+		{
+			name:     "Multiple connection strings",
+			input:    "DB1: postgres://admin:secret@db1.com DB2: postgres://user:pass123@db2.com",
+			expected: "DB1: postgres://admin:[REDACTED:PASSWORD]@db1.com DB2: postgres://user:[REDACTED:PASSWORD]@db2.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := redactor.Redact(tt.input)
+			if result != tt.expected {
+				t.Errorf("Expected:\n%s\nGot:\n%s", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestRedactCaptureGroup_RepeatedTextInMatch tests that capture group redaction
+// works correctly when the captured text appears multiple times in the match.
+// This is a regression test for a bug where strings.Index only found the first
+// occurrence, leaving subsequent occurrences unredacted.
+func TestRedactCaptureGroup_RepeatedTextInMatch(t *testing.T) {
+	tests := []struct {
+		name         string
+		pattern      string
+		captureGroup int
+		input        string
+		expected     string
+	}{
+		{
+			// Pattern where capture group text appears in suffix
+			// e.g., password "admin" connecting to host "admin.example.com"
+			name:         "password appears in hostname",
+			pattern:      `(postgres://[^:]+:)([^@]+)(@[^\s]+)`,
+			captureGroup: 2,
+			input:        "postgres://user:admin@admin.example.com/db",
+			expected:     "postgres://user:[REDACTED:PASSWORD]@admin.example.com/db",
+		},
+		{
+			// Password that matches part of username
+			name:         "password matches username substring",
+			pattern:      `(mysql://[^:]+:)([^@]+)(@[^\s]+)`,
+			captureGroup: 2,
+			input:        "mysql://testtest:test@localhost/db",
+			expected:     "mysql://testtest:[REDACTED:PASSWORD]@localhost/db",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := Config{
+				Patterns: []Pattern{
+					{
+						Name:         tt.name,
+						Pattern:      tt.pattern,
+						Type:         "password",
+						CaptureGroup: tt.captureGroup,
+					},
+				},
+			}
+
+			redactor, err := compilePatterns(config.Patterns)
+			if err != nil {
+				t.Fatalf("Failed to create redactor: %v", err)
+			}
+
+			result := redactor.Redact(tt.input)
+			if result != tt.expected {
+				t.Errorf("Expected:\n%s\nGot:\n%s", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestRedactMultiplePatternTypes tests redacting with multiple pattern types
+func TestRedactMultiplePatternTypes(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-ant-api\d{2}-[A-Za-z0-9_-]{20}`,
+				Type:    "api_key",
+			},
+			{
+				Name:    "AWS Key",
+				Pattern: `AKIA[0-9A-Z]{16}`,
+				Type:    "aws_key",
+			},
+			{
+				Name:    "GitHub Token",
+				Pattern: `ghp_[A-Za-z0-9]{10}`,
+				Type:    "github_token",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	input := "API: sk-ant-api03-12345678901234567890 AWS: AKIAIOSFODNN7EXAMPLE GitHub: ghp_1234567890"
+	result := redactor.Redact(input)
+
+	// Verify all secrets are redacted
+	if strings.Contains(result, "sk-ant-api03") {
+		t.Error("API key should be redacted")
+	}
+	if strings.Contains(result, "AKIAIOSFODNN7EXAMPLE") {
+		t.Error("AWS key should be redacted")
+	}
+	if strings.Contains(result, "ghp_1234567890") {
+		t.Error("GitHub token should be redacted")
+	}
+
+	// Verify redaction markers are present
+	if !strings.Contains(result, "[REDACTED:API_KEY]") {
+		t.Error("Expected API_KEY redaction marker")
+	}
+	if !strings.Contains(result, "[REDACTED:AWS_KEY]") {
+		t.Error("Expected AWS_KEY redaction marker")
+	}
+	if !strings.Contains(result, "[REDACTED:GITHUB_TOKEN]") {
+		t.Error("Expected GITHUB_TOKEN redaction marker")
+	}
+}
+
+// TestRedactEmptyString tests redacting an empty string
+func TestRedactEmptyString(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "Test",
+				Pattern: `test`,
+				Type:    "test",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	result := redactor.Redact("")
+	if result != "" {
+		t.Errorf("Expected empty string, got %s", result)
+	}
+}
+
+// TestRedactMultilineText tests redacting across multiple lines
+func TestRedactMultilineText(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	input := `Line 1: sk-1234567890
+Line 2: Some text
+Line 3: sk-abcdefghij`
+
+	expected := `Line 1: [REDACTED:API_KEY]
+Line 2: Some text
+Line 3: [REDACTED:API_KEY]`
+
+	result := redactor.Redact(input)
+	if result != expected {
+		t.Errorf("Expected:\n%s\nGot:\n%s", expected, result)
+	}
+}
+
+// TestRedactWithInvalidPattern tests handling of invalid regex patterns
+func TestRedactWithInvalidPattern(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "Invalid",
+				Pattern: `[invalid(`,
+				Type:    "test",
+			},
+		},
+	}
+
+	_, err := compilePatterns(config.Patterns)
+	if err == nil {
+		t.Error("Expected error when creating redactor with invalid pattern")
+	}
+}
+
+// TestRedactNoPatterns tests redactor with no patterns
+func TestRedactNoPatterns(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	input := "Some text with sk-1234567890"
+	result := redactor.Redact(input)
+
+	if result != input {
+		t.Errorf("Expected no changes, got: %s", result)
+	}
+}
+
+// TestRedactLargeText tests performance with large text
+func TestRedactLargeText(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	// Create large text with secrets scattered throughout
+	var builder strings.Builder
+	for i := 0; i < 1000; i++ {
+		builder.WriteString("Some regular text here. ")
+		if i%100 == 0 {
+			builder.WriteString("sk-1234567890 ")
+		}
+	}
+
+	input := builder.String()
+	result := redactor.Redact(input)
+
+	// Verify secrets are redacted
+	if strings.Contains(result, "sk-1234567890") {
+		t.Error("API key should be redacted in large text")
+	}
+
+	// Verify redaction markers are present
+	count := strings.Count(result, "[REDACTED:API_KEY]")
+	if count != 10 {
+		t.Errorf("Expected 10 redactions, got %d", count)
+	}
+}
+
+// TestRedactSpecialCharacters tests handling of special characters
+func TestRedactSpecialCharacters(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9_-]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Key with dashes and underscores",
+			input:    "Key: sk-abc_def-12",
+			expected: "Key: [REDACTED:API_KEY]",
+		},
+		{
+			name:     "Key in quotes",
+			input:    `API_KEY="sk-1234567890"`,
+			expected: `API_KEY="[REDACTED:API_KEY]"`,
+		},
+		{
+			name:     "Key in JSON",
+			input:    `{"key":"sk-abcdefghij"}`,
+			expected: `{"key":"[REDACTED:API_KEY]"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := redactor.Redact(tt.input)
+			if result != tt.expected {
+				t.Errorf("Expected:\n%s\nGot:\n%s", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestRedactCaseSensitivity tests case-sensitive pattern matching
+func TestRedactCaseSensitivity(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "AWS Key",
+				Pattern: `AKIA[0-9A-Z]{16}`,
+				Type:    "aws_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	// Should match uppercase
+	result1 := redactor.Redact("AKIAIOSFODNN7EXAMPLE")
+	if !strings.Contains(result1, "[REDACTED:AWS_KEY]") {
+		t.Error("Should redact uppercase AWS key")
+	}
+
+	// Should NOT match lowercase
+	result2 := redactor.Redact("akiaiosfodnn7example")
+	if strings.Contains(result2, "[REDACTED:AWS_KEY]") {
+		t.Error("Should not redact lowercase (pattern is case-sensitive)")
+	}
+}
+
+// TestRedactOrderOfPatterns tests that pattern order doesn't affect results
+func TestRedactOrderOfPatterns(t *testing.T) {
+	config1 := Config{
+		Patterns: []Pattern{
+			{Name: "Pattern A", Pattern: `aaa`, Type: "type_a"},
+			{Name: "Pattern B", Pattern: `bbb`, Type: "type_b"},
+		},
+	}
+
+	config2 := Config{
+		Patterns: []Pattern{
+			{Name: "Pattern B", Pattern: `bbb`, Type: "type_b"},
+			{Name: "Pattern A", Pattern: `aaa`, Type: "type_a"},
+		},
+	}
+
+	redactor1, _ := compilePatterns(config1.Patterns)
+	redactor2, _ := compilePatterns(config2.Patterns)
+
+	input := "Text with aaa and bbb"
+
+	result1 := redactor1.Redact(input)
+	result2 := redactor2.Redact(input)
+
+	// Results should be the same regardless of pattern order
+	if result1 != result2 {
+		t.Errorf("Pattern order should not affect results:\nResult1: %s\nResult2: %s", result1, result2)
+	}
+}
+
+// TestRedactJSONL tests JSON-aware redaction of JSONL content
+func TestRedactJSONL(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Simple string field",
+			input:    `{"message":"My key is sk-1234567890"}`,
+			expected: `{"message":"My key is [REDACTED:API_KEY]"}`,
+		},
+		{
+			name:     "Multiple lines",
+			input:    "{\"a\":\"sk-1234567890\"}\n{\"b\":\"sk-abcdefghij\"}",
+			expected: "{\"a\":\"[REDACTED:API_KEY]\"}\n{\"b\":\"[REDACTED:API_KEY]\"}",
+		},
+		{
+			name:     "Nested object",
+			input:    `{"outer":{"inner":"sk-1234567890"}}`,
+			expected: `{"outer":{"inner":"[REDACTED:API_KEY]"}}`,
+		},
+		{
+			name:     "Array of strings",
+			input:    `{"keys":["sk-1234567890","sk-abcdefghij"]}`,
+			expected: `{"keys":["[REDACTED:API_KEY]","[REDACTED:API_KEY]"]}`,
+		},
+		{
+			name:     "Mixed types preserved",
+			input:    `{"str":"sk-1234567890","num":42,"bool":true,"null":null}`,
+			expected: `{"bool":true,"null":null,"num":42,"str":"[REDACTED:API_KEY]"}`,
+		},
+		{
+			name:     "Empty lines preserved",
+			input:    "{\"a\":\"test\"}\n\n{\"b\":\"sk-1234567890\"}",
+			expected: "{\"a\":\"test\"}\n\n{\"b\":\"[REDACTED:API_KEY]\"}",
+		},
+		{
+			name:     "No secrets - unchanged",
+			input:    `{"message":"hello world"}`,
+			expected: `{"message":"hello world"}`,
+		},
+		{
+			name:     "Deeply nested",
+			input:    `{"a":{"b":{"c":{"d":"sk-1234567890"}}}}`,
+			expected: `{"a":{"b":{"c":{"d":"[REDACTED:API_KEY]"}}}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := redactor.RedactJSONL([]byte(tt.input))
+			if string(result) != tt.expected {
+				t.Errorf("Expected:\n%s\nGot:\n%s", tt.expected, string(result))
+			}
+		})
+	}
+}
+
+// TestRedactJSONLPreservesValidJSON verifies that output is always valid JSON
+func TestRedactJSONLPreservesValidJSON(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	// Input with special characters that could break JSON if not handled properly
+	input := `{"message":"Key: sk-1234567890\nWith newline","quote":"He said \"sk-abcdefghij\""}`
+	result := redactor.RedactJSONL([]byte(input))
+
+	// Verify result is valid JSON
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Errorf("Result is not valid JSON: %v\nResult: %s", err, string(result))
+	}
+
+	// Verify secrets are redacted
+	if strings.Contains(string(result), "sk-1234567890") {
+		t.Error("API key should be redacted")
+	}
+	if strings.Contains(string(result), "sk-abcdefghij") {
+		t.Error("API key in quoted string should be redacted")
+	}
+}
+
+// TestRedactJSONLInvalidJSON tests fallback behavior for invalid JSON lines
+func TestRedactJSONLInvalidJSON(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	// Invalid JSON line should fall back to text-based redaction
+	input := "not valid json with sk-1234567890"
+	result := redactor.RedactJSONL([]byte(input))
+
+	expected := "not valid json with [REDACTED:API_KEY]"
+	if string(result) != expected {
+		t.Errorf("Expected:\n%s\nGot:\n%s", expected, string(result))
+	}
+}
+
+// TestRedactJSONLMixedValidInvalid tests JSONL with mix of valid and invalid lines
+func TestRedactJSONLMixedValidInvalid(t *testing.T) {
+	config := Config{
+		Patterns: []Pattern{
+			{
+				Name:    "API Key",
+				Pattern: `sk-[A-Za-z0-9]{10}`,
+				Type:    "api_key",
+			},
+		},
+	}
+
+	redactor, err := compilePatterns(config.Patterns)
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	input := "{\"key\":\"sk-1234567890\"}\nnot json sk-abcdefghij\n{\"other\":\"sk-0987654321\"}"
+	result := redactor.RedactJSONL([]byte(input))
+
+	// First line: valid JSON, should be parsed and redacted
+	// Second line: invalid JSON, should fall back to text redaction
+	// Third line: valid JSON, should be parsed and redacted
+	resultStr := string(result)
+
+	if strings.Contains(resultStr, "sk-1234567890") {
+		t.Error("First API key should be redacted")
+	}
+	if strings.Contains(resultStr, "sk-abcdefghij") {
+		t.Error("Second API key should be redacted (text fallback)")
+	}
+	if strings.Contains(resultStr, "sk-0987654321") {
+		t.Error("Third API key should be redacted")
+	}
+}
+
+// BenchmarkRedactJSONL benchmarks JSON-aware redaction
+func BenchmarkRedactJSONL(b *testing.B) {
+	redactor, _ := NewFromConfig(&config.RedactionConfig{Enabled: true})
+
+	// Generate realistic JSONL content (~1MB)
+	input := generateTestJSONL(1000)
+
+	b.ResetTimer()
+	b.SetBytes(int64(len(input)))
+	for i := 0; i < b.N; i++ {
+		redactor.RedactJSONL(input)
+	}
+}
+
+// generateTestJSONL creates realistic transcript-like JSONL for benchmarking
+func generateTestJSONL(lines int) []byte {
+	var builder strings.Builder
+	for i := 0; i < lines; i++ {
+		// Mix of message types similar to real transcripts
+		switch i % 4 {
+		case 0:
+			builder.WriteString(`{"type":"user","timestamp":"2024-01-15T10:00:00Z","message":{"role":"user","content":"Please help me with this code that uses sk-ant-api03-xxxxxxxxxxxxxxxxxxxxx for authentication"}}`)
+		case 1:
+			builder.WriteString(`{"type":"assistant","timestamp":"2024-01-15T10:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll help you with that. Here's the updated code with proper error handling and validation."}]}}`)
+		case 2:
+			builder.WriteString(`{"type":"tool_use","timestamp":"2024-01-15T10:00:02Z","tool":"bash","input":{"command":"echo $OPENAI_KEY"},"output":"sk-1234567890abcdefghijklmnopqrstuvwxyz123456"}`)
+		case 3:
+			builder.WriteString(`{"type":"result","timestamp":"2024-01-15T10:00:03Z","data":{"nested":{"deeply":{"value":"Some text with postgres://user:secretpass@localhost:5432/db connection string"}}}}`)
+		}
+		if i < lines-1 {
+			builder.WriteByte('\n')
+		}
+	}
+	return []byte(builder.String())
+}
+
+// TestPrivateKeyFullRedaction verifies that the entire private key body is redacted
+func TestPrivateKeyFullRedaction(t *testing.T) {
+	redactor, err := NewFromConfig(&config.RedactionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "RSA Private Key",
+			input: `Here is a key:
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MqNr8gquYeLD
+base64encodedprivatekeycontenthere1234567890abcdefghijklmnop
+morebase64contentABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+-----END RSA PRIVATE KEY-----
+And some text after`,
+		},
+		{
+			name: "EC Private Key",
+			input: `-----BEGIN EC PRIVATE KEY-----
+MHQCAQEEIBYj8AoXMD8VwIj8RmT6M0fdefaultecprivatekeycontent
+-----END EC PRIVATE KEY-----`,
+		},
+		{
+			name: "OpenSSH Private Key",
+			input: `-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAlwAAAAdzc2gtcn
+-----END OPENSSH PRIVATE KEY-----`,
+		},
+		{
+			name: "PKCS#8 Private Key",
+			input: `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7pk8a
+-----END PRIVATE KEY-----`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := redactor.Redact(tc.input)
+
+			// Should contain the redaction marker
+			if !strings.Contains(result, "[REDACTED:PRIVATE_KEY]") {
+				t.Errorf("Expected redaction marker in result:\n%s", result)
+			}
+
+			// Should NOT contain any base64 key content
+			if strings.Contains(result, "MII") {
+				t.Errorf("Key content 'MII' should be redacted:\n%s", result)
+			}
+			if strings.Contains(result, "b3Blbn") {
+				t.Errorf("Key content 'b3Blbn' should be redacted:\n%s", result)
+			}
+
+			// Should NOT contain BEGIN or END markers (they're part of the redacted content)
+			if strings.Contains(result, "-----BEGIN") {
+				t.Errorf("BEGIN marker should be redacted:\n%s", result)
+			}
+			if strings.Contains(result, "-----END") {
+				t.Errorf("END marker should be redacted:\n%s", result)
+			}
+		})
+	}
+}
+
+// TestOpenAIKeyFullRedaction verifies that both old and new format OpenAI keys are fully redacted
+func TestOpenAIKeyFullRedaction(t *testing.T) {
+	redactor, err := NewFromConfig(&config.RedactionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "Legacy OpenAI key",
+			input: "My API key is sk-1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL",
+		},
+		{
+			name:  "New project-based OpenAI key",
+			input: "Use this key: sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := redactor.Redact(tc.input)
+
+			// Should contain the redaction marker
+			if !strings.Contains(result, "[REDACTED:API_KEY]") {
+				t.Errorf("Expected redaction marker in result:\n%s", result)
+			}
+
+			// Should NOT contain any part of the key
+			if strings.Contains(result, "sk-") {
+				t.Errorf("Key prefix 'sk-' should be redacted:\n%s", result)
+			}
+			if strings.Contains(result, "proj-") {
+				t.Errorf("Key component 'proj-' should be redacted:\n%s", result)
+			}
+		})
+	}
+}
+
+// TestRedactFieldPattern tests field-based pattern matching where redaction is
+// triggered by the JSON field name rather than the value format.
+func TestRedactFieldPattern(t *testing.T) {
+	t.Run("field pattern without value pattern redacts entire value", func(t *testing.T) {
+		cfg := Config{
+			Patterns: []Pattern{
+				{
+					Name:         "Sensitive Field",
+					FieldPattern: `(?i)^(password|secret|api_key)$`,
+					Type:         "sensitive_field",
+				},
+			},
+		}
+
+		redactor, err := compilePatterns(cfg.Patterns)
+		if err != nil {
+			t.Fatalf("Failed to create redactor: %v", err)
+		}
+
+		input := `{"password":"hunter2","username":"admin"}`
+		result := redactor.RedactJSONLine(input)
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Fatalf("Result is not valid JSON: %v", err)
+		}
+
+		if parsed["password"] != "[REDACTED:SENSITIVE_FIELD]" {
+			t.Errorf("password should be redacted, got: %v", parsed["password"])
+		}
+		if parsed["username"] != "admin" {
+			t.Errorf("username should not be redacted, got: %v", parsed["username"])
+		}
+	})
+
+	t.Run("field pattern with value pattern redacts matching parts", func(t *testing.T) {
+		cfg := Config{
+			Patterns: []Pattern{
+				{
+					Name:         "Token in auth field",
+					FieldPattern: `(?i)^authorization$`,
+					Pattern:      `Bearer\s+(\S+)`,
+					Type:         "auth_token",
+					CaptureGroup: 1,
+				},
+			},
+		}
+
+		redactor, err := compilePatterns(cfg.Patterns)
+		if err != nil {
+			t.Fatalf("Failed to create redactor: %v", err)
+		}
+
+		input := `{"authorization":"Bearer sk-abc123","other":"Bearer sk-abc123"}`
+		result := redactor.RedactJSONLine(input)
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Fatalf("Result is not valid JSON: %v", err)
+		}
+
+		// Field "authorization" matches field pattern, so value pattern applies
+		auth := parsed["authorization"].(string)
+		if !strings.Contains(auth, "[REDACTED:AUTH_TOKEN]") {
+			t.Errorf("authorization field should have redacted token, got: %v", auth)
+		}
+		if !strings.Contains(auth, "Bearer") {
+			t.Errorf("authorization field should preserve 'Bearer' prefix, got: %v", auth)
+		}
+
+		// Field "other" does NOT match field pattern, so value is untouched
+		if parsed["other"] != "Bearer sk-abc123" {
+			t.Errorf("other field should not be redacted, got: %v", parsed["other"])
+		}
+	})
+
+	t.Run("field pattern case insensitive matching", func(t *testing.T) {
+		cfg := Config{
+			Patterns: []Pattern{
+				{
+					Name:         "Sensitive Field",
+					FieldPattern: `(?i)^(password|secret)$`,
+					Type:         "sensitive_field",
+				},
+			},
+		}
+
+		redactor, err := compilePatterns(cfg.Patterns)
+		if err != nil {
+			t.Fatalf("Failed to create redactor: %v", err)
+		}
+
+		// JSON field names are case-sensitive, but our field pattern uses (?i)
+		input := `{"Password":"hunter2","SECRET":"top-secret","other":"safe"}`
+		result := redactor.RedactJSONLine(input)
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Fatalf("Result is not valid JSON: %v", err)
+		}
+
+		if parsed["Password"] != "[REDACTED:SENSITIVE_FIELD]" {
+			t.Errorf("Password should be redacted, got: %v", parsed["Password"])
+		}
+		if parsed["SECRET"] != "[REDACTED:SENSITIVE_FIELD]" {
+			t.Errorf("SECRET should be redacted, got: %v", parsed["SECRET"])
+		}
+		if parsed["other"] != "safe" {
+			t.Errorf("other should not be redacted, got: %v", parsed["other"])
+		}
+	})
+
+	t.Run("field pattern with nested objects", func(t *testing.T) {
+		cfg := Config{
+			Patterns: []Pattern{
+				{
+					Name:         "Sensitive Field",
+					FieldPattern: `(?i)^password$`,
+					Type:         "sensitive_field",
+				},
+			},
+		}
+
+		redactor, err := compilePatterns(cfg.Patterns)
+		if err != nil {
+			t.Fatalf("Failed to create redactor: %v", err)
+		}
+
+		input := `{"user":{"password":"secret","name":"alice"}}`
+		result := redactor.RedactJSONLine(input)
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Fatalf("Result is not valid JSON: %v", err)
+		}
+
+		user := parsed["user"].(map[string]interface{})
+		if user["password"] != "[REDACTED:SENSITIVE_FIELD]" {
+			t.Errorf("nested password should be redacted, got: %v", user["password"])
+		}
+		if user["name"] != "alice" {
+			t.Errorf("nested name should not be redacted, got: %v", user["name"])
+		}
+	})
+
+	t.Run("field pattern with arrays inherits parent field name", func(t *testing.T) {
+		cfg := Config{
+			Patterns: []Pattern{
+				{
+					Name:         "Sensitive Field",
+					FieldPattern: `(?i)^secrets$`,
+					Type:         "sensitive_field",
+				},
+			},
+		}
+
+		redactor, err := compilePatterns(cfg.Patterns)
+		if err != nil {
+			t.Fatalf("Failed to create redactor: %v", err)
+		}
+
+		input := `{"secrets":["key1","key2"],"labels":["public","info"]}`
+		result := redactor.RedactJSONLine(input)
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Fatalf("Result is not valid JSON: %v", err)
+		}
+
+		secrets := parsed["secrets"].([]interface{})
+		for i, s := range secrets {
+			if s != "[REDACTED:SENSITIVE_FIELD]" {
+				t.Errorf("secrets[%d] should be redacted, got: %v", i, s)
+			}
+		}
+
+		labels := parsed["labels"].([]interface{})
+		if labels[0] != "public" || labels[1] != "info" {
+			t.Errorf("labels should not be redacted, got: %v", labels)
+		}
+	})
+
+	t.Run("field and value patterns combine correctly", func(t *testing.T) {
+		cfg := Config{
+			Patterns: []Pattern{
+				// Field-based: redact password fields entirely
+				{
+					Name:         "Password Field",
+					FieldPattern: `(?i)^password$`,
+					Type:         "password",
+				},
+				// Value-based: redact API keys anywhere
+				{
+					Name:    "API Key",
+					Pattern: `sk-[A-Za-z0-9]{10}`,
+					Type:    "api_key",
+				},
+			},
+		}
+
+		redactor, err := compilePatterns(cfg.Patterns)
+		if err != nil {
+			t.Fatalf("Failed to create redactor: %v", err)
+		}
+
+		input := `{"password":"hunter2","note":"my key is sk-ABCDEFGHIJ"}`
+		result := redactor.RedactJSONLine(input)
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Fatalf("Result is not valid JSON: %v", err)
+		}
+
+		if parsed["password"] != "[REDACTED:PASSWORD]" {
+			t.Errorf("password should be redacted by field pattern, got: %v", parsed["password"])
+		}
+
+		note := parsed["note"].(string)
+		if !strings.Contains(note, "[REDACTED:API_KEY]") {
+			t.Errorf("note should have API key redacted, got: %v", note)
+		}
+		if strings.Contains(note, "sk-ABCDEFGHIJ") {
+			t.Errorf("API key should not remain in note, got: %v", note)
+		}
+	})
+}
+
+// TestRedactor_UnicodeFieldName verifies field-pattern matching works
+// against non-ASCII field names. The Go json decoder handles Unicode
+// keys fine; if the regex doesn't, secrets in Unicode-keyed fields
+// would slip through unredacted.
+func TestRedactor_UnicodeFieldName(t *testing.T) {
+	cfg := Config{
+		Patterns: []Pattern{
+			{
+				Name:         "Unicode-aware password field",
+				FieldPattern: `^(?i)(password|パスワード|пароль)$`,
+				Type:         "sensitive_field",
+			},
+		},
+	}
+	r, err := compilePatterns(cfg.Patterns)
+	if err != nil {
+		t.Fatalf("compilePatterns: %v", err)
+	}
+
+	cases := []struct {
+		name       string
+		input      string
+		field      string
+		mustRedact string
+	}{
+		{"ASCII password still matches", `{"password":"hunter2","note":"safe"}`, "password", "hunter2"},
+		{"Japanese パスワード", `{"パスワード":"日本語秘密","note":"safe"}`, "パスワード", "日本語秘密"},
+		{"Russian пароль", `{"пароль":"русский_секрет","note":"safe"}`, "пароль", "русский_секрет"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			out := r.RedactJSONLine(tt.input)
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+				t.Fatalf("redacted output not valid JSON: %v\nout=%s", err, out)
+			}
+			if v, ok := parsed[tt.field].(string); !ok {
+				t.Errorf("field %q missing or wrong type in output: %v", tt.field, parsed)
+			} else if strings.Contains(v, tt.mustRedact) {
+				t.Errorf("field %q still contains unredacted secret %q: got %q", tt.field, tt.mustRedact, v)
+			}
+			if got, ok := parsed["note"].(string); !ok || got != "safe" {
+				t.Errorf("note should be untouched, got %v", parsed["note"])
+			}
+		})
+	}
+}
+
+// TestNewFromConfig_DisablesDefaultsWhenFlagFalse verifies the
+// UseDefaultPatterns=false branch in redactor.NewFromConfig
+// (redactor.go:46). Without this, a user who explicitly disables
+// defaults could still see them applied if the flag check broke.
+func TestNewFromConfig_DisablesDefaultsWhenFlagFalse(t *testing.T) {
+	useDefaults := false
+	cfg := &config.RedactionConfig{
+		Enabled:            true,
+		UseDefaultPatterns: &useDefaults,
+		Patterns: []config.RedactionPattern{
+			{Name: "custom-token", Pattern: `CUSTOM-\d+`, Type: "test"},
+		},
+	}
+	r, err := NewFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	if r == nil {
+		t.Fatal("expected non-nil redactor with custom patterns + defaults off")
+	}
+
+	// Anthropic key (built-in pattern) must NOT be redacted because
+	// defaults are off.
+	anthropicKey := "sk-ant-api03-" + strings.Repeat("a", 95)
+	customToken := "CUSTOM-12345"
+	input := "see " + anthropicKey + " and " + customToken
+
+	out := r.Redact(input)
+	if !strings.Contains(out, anthropicKey) {
+		t.Errorf("Anthropic key should NOT be redacted (defaults off); got %q", out)
+	}
+	if strings.Contains(out, customToken) {
+		t.Errorf("Custom pattern should redact %q; got %q", customToken, out)
+	}
+}
+
+// TestRedact_NoCatastrophicBacktracking guards against regex
+// catastrophic backtracking on degenerate inputs. The private-key
+// patterns use `(?s).*?` which would hang under PCRE on a marker
+// without a closing terminator. Go's regexp uses RE2 (linear time, no
+// backtracking) by design, so this test pins the invariant: a runaway
+// input must redact (or pass through) in bounded time. If anyone
+// switches to a backtracking engine, this test fails loudly.
+//
+// The daemon ingests untrusted user-transcript content; freezing the
+// process on a malicious payload would be a real DoS vector.
+func TestRedact_NoCatastrophicBacktracking(t *testing.T) {
+	r, err := NewFromConfig(&config.RedactionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	if r == nil {
+		t.Fatal("expected non-nil redactor")
+	}
+
+	// 256KB of `A` after a private-key opening marker, no closing marker.
+	// On a backtracking engine this would explore O(2^n) paths while
+	// keeping the linear-time RE2 case fast enough under the race detector.
+	var b strings.Builder
+	b.WriteString("-----BEGIN RSA PRIVATE KEY-----\n")
+	for i := 0; i < 256*1024; i++ {
+		b.WriteByte('A')
+	}
+	input := b.String()
+
+	done := make(chan struct{})
+	var out string
+	go func() {
+		out = r.Redact(input)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Pattern requires the closing marker, so input is preserved.
+		if len(out) != len(input) {
+			t.Errorf("Redact altered length unexpectedly: in=%d out=%d", len(input), len(out))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Redact did not return within 2s on degenerate input — possible catastrophic backtracking introduced")
+	}
+}

@@ -1,0 +1,167 @@
+# cmd/
+
+OpenCode portable setup binds the current executable's absolute path into the plugin, so sync does not require PATH. `setup` refreshes stale bindings; `hooks add --provider opencode` rebinds after moving a binary. `install` remains optional and preserves `.exe` on Windows. See [the portable guide](../docs/windows-portable.md).
+
+CLI command layer built on [Cobra](https://github.com/spf13/cobra). Each file defines one or more commands and registers them via `init()`.
+
+## Files
+
+| File | Role |
+|------|------|
+| `root.go` | Root command, persistent pre/post hooks, logger init |
+| `helpers.go` | Shared command helpers for authenticated HTTP clients and session API error translation. `newAuthedClient()` (default binding) → `newAuthedClientForBinding(Binding)` → `clientForFlags(provider, configDir)` resolves the retrieval commands' `--provider`/`--config-dir` binding selection (kata szwk). `withSetupHint(err, provider, configDir)` annotates `config.ErrNoBinding` with the exact `confab setup` remediation command — shared by `clientForFlags` and `save`'s `resolveSaveContext` (kata z0rt). |
+| `hook.go` | Parent command for hook handlers (`confab hook <type>`) |
+| `hook_sessionstart.go` | `session-start` hook: spawns sync daemon. Provider-agnostic — selects via `--provider` flag and routes through `provider.Provider`. |
+| `hook_sessionend.go` | `session-end` hook: stops sync daemon. Claude, OpenCode, and Cursor handle it (OpenCode's plugin fires it on `dispose`, routed to `sessionEndOpencode`; Cursor routes to `sessionEndCursor`, which reads the `CursorHookInput`, forwards the `reason` as a session_end event, and stops the daemon under the `cursor` provider namespace); Codex shutdown is parent-PID driven and explicitly rejects this command. For Cursor the CLI `sessionEnd` is reliable, but the IDE only fires it on window/app close (not per chat-tab) — so the daemon's parent-PID liveness on `Cursor.app` is the primary IDE shutdown, with `sessionEnd` a clean bonus (kata 6kys). |
+| `hook_pretooluse.go` | `pre-tool-use` hook: injects Confab links into git commits and PRs (Claude/Codex deny+instruct; dispatches Cursor to `hook_tooluse_cursor.go`) |
+| `hook_posttooluse.go` | `post-tool-use` hook: links GitHub artifacts to Confab sessions (dispatches Cursor to `hook_tooluse_cursor.go`) |
+| `hook_userpromptsubmit.go` | `user-prompt-submit` hook: ensures daemon is running |
+| `hook_tooluse_input.go` | `readToolUseHookInput()` adapter mapping `ClaudeHookInput` / `CodexHookInput` into a shared `toolUseHookInput` shape for the pre/post-tool-use handlers |
+| `hook_tooluse_cursor.go` | Cursor pre/post-tool-use handlers (65aq). `handlePreToolUseCursor` rewrites the Shell command in place via `updated_input` (`--trailer "Confab-Link: <url>"` for git commit; the `📝 [Confab link](<url>)` line in the PR `--body` for `gh pr create`) and returns `CursorToolUseResponse{permission, updated_input}` — a Cursor-native injection rather than Claude/Codex's deny+instruct. `handlePostToolUseCursor` reads `tool_output.{output,exitCode}`, skips on non-zero exit, and links the PR URL (from the output) / commit URL (full SHA re-derived via `git rev-parse`, like Claude/Codex). |
+| `hooks.go` | `confab hooks add/remove` — install/uninstall hooks. `--provider` defaults to "" (kata m9mb): `add` auto-detects installed providers, `remove` covers all providers; an explicit `--provider` scopes to one. Resolves targets via the shared `detectedOrNamedProviders`/`allOrNamedProviders` helpers (also used by `skills.go`). |
+| `sync.go` | `confab sync start/stop/status` — daemon management |
+| `spawn.go` | Generic `maybeSpawnDaemon(p, *daemonLaunchInput)` — single dispatch for Claude, Codex, OpenCode, and Cursor daemon spawn. `daemonLaunchInput` is the canonical wire format between the hook and the freshly-spawned daemon process. For OpenCode, `TranscriptPath` is empty at spawn time — the daemon's collector materializes the transcript from the local SQLite DB. For Cursor, `Model` carries the session's LLM model from the `sessionStart` payload (read in `buildStandardLaunchArgs` via an optional `Model()` type-assert on the hook input); the daemon forwards it to the engine, which stamps it onto transcript chunk metadata (spm9). |
+| `login.go` | Device code auth flow and API key login |
+| `logout.go` | Clear stored credentials |
+| `setup.go` | One-command setup: auth + hooks + bundled skills. Bare `confab setup --backend-url ...` auto-detects every provider whose CLI is on `PATH` **or** whose state/config dir is present (via `provider.DetectInstalled`, CF-572 — covers desktop-app installs) and installs hooks/skills for each. `--provider X` overrides to single-provider mode (`claude-code`, `codex`, `opencode`, or `cursor`). Cursor is now in `provider.DetectInstalled` (kata r5mg — `cursor-agent` on PATH or a present `~/.cursor` state dir, so IDE-only installs count), so bare `setup` configures it alongside the others; `--provider cursor` still scopes setup to Cursor only. `--config-dir <dir>` (requires `--provider`; claude-code only for now, kata hpec) installs into a non-default provider config dir and writes the backend creds to that `(provider, dir)` binding instead of the global top-level config — `setup --config-dir C1 --backend-url B1` then `--config-dir C2 --backend-url B2` route C1→B1 and C2→B2. Passing the default dir explicitly collapses to the global config. Best-effort across providers: per-provider failure is reported in a summary but doesn't abort the loop. |
+| `status.go` | Show backend auth + per-provider hook/skill state for every supported provider (iterates `provider.OrderedNames()`). No `--provider` flag — output always covers all providers. A provider is "present" when its CLI is on `PATH` **or** its state/config dir exists (CF-572); the CLI line notes `(state dir present)` for desktop-only installs. No orphan-hook detection: installed hooks live inside the state dir, so `IsHooksInstalled ⟹ StateDirPresent` and an "orphaned" state is unreachable. |
+| `list.go` | List local sessions (dispatches through `provider.Provider.ScanSessions`). `--provider` is **required** (kata m9mb — no claude-code default; cobra errors if omitted); help enumerates claude-code/codex/cursor/opencode. Output hints are provider-accurate via `providerSaveHint(p)` (empty for the default claude-code, `--provider <name> ` otherwise) — no codex special-case (kata z0rt). OpenCode is supported offline (kata t6d5): `Opencode.ScanSessions` enumerates root sessions from the local SQLite DB, with the TITLE column populated from each session's first user message (a bounded per-session secondary read; OpenCode has no summary). |
+| `list_utils.go` | Duration parsing, session filtering — fully provider-agnostic |
+| `save.go` | Manual session upload by ID (dispatches through `provider.Provider.FindSessionByID` + `DefaultCWD`). `--provider` is **required** (kata m9mb — no claude-code default; cobra errors if omitted). `resolveSaveContext(provider, configDir)` resolves the backend upload config + discovery provider: `--config-dir` (requires `--provider`; claude-code only via `GetWithDir`) routes the upload to that `(provider, dir)` binding's backend and discovers locally under the custom dir (kata z0rt/hpec); with no `--config-dir` it's the unchanged default-binding path. OpenCode is supported offline (kata t6d5): `Opencode.FindSessionByID` resolves a (partial) id up to its root and materializes the root transcript on demand; `uploadSingleSession` then calls `setupOpencodeSaveEngine` (see `save_opencode.go`) so `engine.SyncAll`'s `DiscoverDescendants` materializes + registers every descendant as an agent sidechain — full parity with live capture. |
+| `save_opencode.go` | OpenCode offline-save wiring (kata t6d5). `opencodeOfflineRegistrar` is the offline counterpart to the daemon's `opencodeRegistrar`: it satisfies `provider.OpencodeDescendantRegistrar` so the same `Opencode.DiscoverDescendants` seam drives descendant capture, but `RegisterOpencodeChild` materializes each child **synchronously** (one-shot `provider.MaterializeOpenCodeSession`) before registering it as a path-encoded agent sidechain — no background collector. Capability gating reuses the engine's cached `OpencodeChildFilesAllowed` (the `opencode_subagent_files` flag), so an old backend never receives unsupported files. `setupOpencodeSaveEngine` is a no-op for non-OpenCode providers. |
+| `install.go` | Copy binary to `~/.local/bin/` |
+| `update.go` | Check/install updates from GitHub Releases |
+| `retro.go` | `confab retro` — fetch session transcript for retrospective (invoked by /retro skill) |
+| `session.go` | Parent command for session subcommands (`confab session <cmd>`). Owns the persistent `--provider`/`--config-dir` binding-selection flags shared by all three subcommands (kata szwk). |
+| `session_get_summary.go` | `confab session get-summary` — fetch condensed session transcript from backend |
+| `session_download.go` | `confab session download` — download raw JSONL transcript files from backend |
+| `session_list_files.go` | `confab session list-files` — list transcript file metadata for a session |
+| `skills.go` | `confab skills add/remove` — install/uninstall bundled skills for supported providers. `add` defaults to detected providers; `remove` defaults to all supported provider dirs (now includes opencode — kata m9mb bug fix). Target resolution shares `detectedOrNamedProviders`/`allOrNamedProviders` with `hooks.go`. |
+| `announce.go` | General announcement system for post-update feature notifications |
+| `autoupdate.go` | Enable/disable auto-update |
+| `version.go` | Print version info |
+| `redaction.go` | Test redaction rules against a file |
+
+## Command Tree
+
+```
+confab
+├── hook
+│   ├── session-start          (also: sync start)
+│   ├── session-end            (also: sync stop)
+│   ├── pre-tool-use
+│   ├── post-tool-use
+│   └── user-prompt-submit
+├── sync
+│   ├── start / stop
+│   └── status
+├── hooks
+│   ├── add
+│   └── remove
+├── skills
+│   ├── add
+│   └── remove
+├── session
+│   ├── get-summary
+│   ├── download
+│   └── list-files
+├── retro
+├── login / logout
+├── setup
+├── status
+├── list
+├── save
+├── install
+├── update
+├── autoupdate [enable|disable]
+├── version
+└── redaction-test
+```
+
+## How to Extend
+
+### Adding a new command
+
+1. Create `cmd/<name>.go`
+2. Define a `cobra.Command` with `Use`, `Short`, `RunE`
+3. In `init()`, call `rootCmd.AddCommand(<name>Cmd)` (or attach to a parent command)
+4. Register flags in `init()` via `<name>Cmd.Flags()`
+5. Follow existing patterns — look at `save.go` for a simple example, `login.go` for a complex one
+
+### Adding a new hook type
+
+This is a cross-cutting change spanning multiple packages:
+
+1. **`cmd/hook_<name>.go`** — Create hook handler. Read JSON from stdin via `p.ParseSessionHook(r)`, do work, write the response via `p.WriteHookResponse(w, ...)`.
+2. **`pkg/hookconfig/{claude,codex}.go`** — Add `Install<Name>Hook()`, `Uninstall<Name>Hook()`, `Is<Name>HookInstalled()`. Wire them into the provider's `InstallHooks` / `UninstallHooks` / `IsHooksInstalled` in `pkg/provider/{claude,codex}.go`.
+3. **`cmd/hooks.go`** — No change needed; `p.InstallHooks()` covers it.
+4. **`cmd/status.go`** — No change needed; `p.IsHooksInstalled()` covers it.
+5. **`cmd/hook.go`** — Register the new hook command under `hookCmd`.
+
+### Adding a new skill
+
+1. **`pkg/config/skill_<name>.go`** — Add provider-rendered template constants/snippets.
+2. **`pkg/config/bundled_skills.go`** — Add the skill name to `bundledSkillNames` and `bundledSkillTemplate`.
+3. **`cmd/announce.go`** — Add an `Announcement` entry for Claude auto-rollout on update if the skill should be announced.
+4. **Provider methods** — `Provider.InstallSkills()` / `UninstallSkills()` / `IsSkillInstalled()` automatically pick up the bundled registry when they call `pkg/config`.
+
+## Invariants
+
+- **All `io.ReadAll` calls must be bounded.** `login.go` and other commands that read HTTP responses or stdin use `io.LimitReader` to prevent memory exhaustion. Never use unbounded `io.ReadAll` on external input.
+- **Environment variable duration overrides are capped.** `hook_sessionstart.go` caps env var durations (e.g., sync interval) to prevent abuse via unreasonable values.
+- **Tar extraction in `update.go` has size and path limits.** Extracted files are bounded to prevent zip-bomb attacks, and paths are validated to prevent directory traversal.
+- **Hook commands must read JSON from stdin and complete quickly.** Claude Code blocks waiting for hook responses. Long-running work must be delegated (e.g., daemon spawn).
+- **Hook commands must not write to stdout except for `ClaudeHookResponse` JSON.** Claude Code parses stdout as the hook response. Use stderr for status messages.
+- **Hook commands parse stdin via `p.ParseSessionHook(r)`.** Returns the provider-agnostic `provider.HookInput` view. Session hooks also validate `transcript_path`.
+- **Hook handlers must always output valid JSON**, even on error. An error should produce a response with `continue: true` rather than crashing with no output.
+- **Commands use `RunE` (not `Run`)** to return errors. Cobra handles error display.
+
+## Design Decisions
+
+**Hooks are thin wrappers.** Hook command files read stdin, call into `pkg/` packages, and write the response. Business logic lives in the packages, not in command handlers. This keeps hooks testable and the command layer simple.
+
+**`hook.go` dispatches vs. separate binaries.** All hooks go through a single `confab hook <type>` command rather than separate binaries. This simplifies installation (one binary) and hook management (consistent command pattern).
+
+**`spawn.go` uses `exec.Command` with `Setpgid`.** The daemon must outlive the hook command. `Setpgid: true` creates a new process group so the daemon isn't killed when the hook exits.
+
+**`maybeSpawnDaemon(p, *daemonLaunchInput)` is generic over the provider.** Both `session-start` and `user-prompt-submit` call it. The function asks the provider's `ShouldSpawnForInput` gate, checks for an already-running daemon via `daemon.LoadStateForProvider` (calling `p.OnAlreadyRunning(externalID)` when the gate fires — OpenCode logs a Warn for multi-process resume, Claude/Codex no-op), prefers the launch input's `ParentPID` if non-zero (plugin-authoritative for OpenCode) and otherwise falls back to `p.FindParentPID()`. The walk runs regardless for observability — a Warn logs when plugin and walk disagree so production drift is visible (CF-549 M1). The `launchAsHookInput` internal adapter bridges the `HookInput` interface signature to the mutable `daemonLaunchInput` so `WalkUpToRoot` rewrites can land on the spawn-side struct.
+
+**OpenCode resume path: `buildOpencodeLaunchArgs` reads `{session_id, cwd, parent_id?, parent_pid}` from stdin.** On `session.created`, `cwd` is inline and the build is a straight copy. On a reconcile event (`session.status`/`updated`/`compacted`/`error`), `cwd` is empty and `resolveOpencodeSessionInfo` reads `directory` + `parent_id` from OpenCode's SQLite via `provider.OpenCodeDBReader.ReadSessionInfo` with a 2-second context bound. If the lookup errors, a Warn is logged and the launch proceeds with empty defaults; if the row is absent (`sql.ErrNoRows`), the launch proceeds with empty defaults and a non-empty inline `parent_id` is preserved so subagent suppression still fires (CF-549).
+
+**Reaper fires on every session-start.** `sessionStartFromReader` launches `daemon.ReapStaleStates()` in a goroutine so cleanup of state files left by crashed/killed daemons is opportunistic and non-blocking. Provider-agnostic; failures are debug-level.
+
+**SessionStart routes every firing through `p.WalkUpToRoot`.** Identity for Claude; thread-edge walk for Codex. For Codex, every subagent SessionStart that lands in an already-running root tree becomes a no-op via state-file dedup. `confab save --provider codex <subagent-uuid>` performs the same walk-up so manual saves of any UUID in a tree always sync the whole tree.
+
+**SessionStart keeps bundled skills aligned with hooks.** Claude runs announcements, which install missing skills and return a visible system message. Codex silently ensures bundled skills under `~/.codex/skills/` so users who installed hooks get the same Confab skills without extra setup.
+
+**`list`, `save` route discovery through the `Provider` interface (CF-398).** Adding a new provider requires only `pkg/provider/<name>.go` + `<name>_discovery.go` — no changes in `cmd/`. `list`/`save` now **require** an explicit `--provider` (kata m9mb — no claude-code flag default). The remaining `provider.NameClaudeCode` references in `cmd/` are the machine-invoked `hook` command's back-compat default (`cmd/hook.go`) plus `cmd/list.go`'s `providerSaveHint`/no-sessions message, both of which gate only on "is this the default (claude-code) provider?" — no per-provider special-casing (kata z0rt generalized the former codex-only "save" hint).
+
+**Pre/PostToolUse hook handlers route by `--provider`.** `cmd/hook_pretooluse.go` and `cmd/hook_posttooluse.go` resolve the provider via `resolveCommitLinkingProvider()` (normalizes the flag and gates on `Provider.SupportsCommitLinking()`). **Cursor takes its own path** (`p.Name()==NameCursor` → `handlePreToolUseCursor`/`handlePostToolUseCursor` in `hook_tooluse_cursor.go`) because its response shape (`permission`/`updated_input` rewrite) and postToolUse payload (`tool_output` is a `{output,exitCode}` object) differ from Claude/Codex; see the file row above. Claude/Codex read hook input through `cmd/hook_tooluse_input.go`'s `readToolUseHookInput()` adapter that maps either `ClaudeHookInput` or `CodexHookInput` into a shared `toolUseHookInput` shape, and deny+instruct. `getConfabSessionID(p, sessionID)` tries the firing UUID's daemon state first and walks up via `p.WalkUpToRoot` on miss — identity for Claude/Cursor, SQLite walk for Codex (so subagent-initiated commits/PRs link to the root session). `hook_userpromptsubmit.go` remains hard-bound to `provider.ClaudeCode{}`: Codex's daemon liveness is parent-PID monitored, so the teleport case UserPromptSubmit addresses doesn't apply.
+
+**Per-(provider, config dir) backend resolution is runtime-derived, not embedded (kata hpec).** Installed hook commands are byte-identical regardless of config dir. At runtime `configDirForHook(provider, transcriptPath)` (in `hook_sessionstart.go`) resolves which backend a Claude session belongs to: it **short-circuits to `""`** (the global/default binding) when `config.HasBindings` is false — so pure single-dir users run an unchanged path — otherwise it derives the config dir from `transcriptPath` via `ClaudeCode.ConfigDirFromTranscript` (failure also falls back to default). SessionStart/UserPromptSubmit thread the derived dir into the daemon launch (`daemonLaunchInput.ConfigDir`); Pre/PostToolUse use `uploadConfigForHook(p, transcriptPath)` → `provider.BindingFor` → `config.GetUploadConfigFor` so commit/PR links use the session's own backend. A derived custom dir with no stored binding returns `ErrNoBinding` (link/sync skipped, never the default backend). Non-Claude providers always resolve to the default binding (their `--config-dir` support is a fast-follow).
+
+**OpenCode lifecycle is plugin-driven; data sync is the daemon's job.** OpenCode has no settings/config hook system, so `confab setup` installs a TS plugin into `~/.config/opencode/plugins/`. The plugin only fires `confab hook session-start` / `session-end --provider opencode` for lifecycle; it never streams transcript data. The spawned daemon's collector reads OpenCode's local SQLite DB and materializes a transcript file. Offline discovery (`list`/`save`) is also supported (kata t6d5): instead of an on-disk transcript, `ScanSessions` enumerates root sessions straight from the SQLite DB, and `save` materializes the root (and its descendant tree, as agent sidechains) on demand before uploading through the ordinary file-sync engine.
+
+**Cursor reuses the Claude file-first lifecycle with a hybrid shutdown (kata mpys/6kys).** SessionStart needs no `cmd/` cursor branch: Cursor's `transcript_path` is `null` at sessionStart, but `Cursor.ParseSessionHook` derives it from `workspace_roots[0]` + `session_id`, so the standard `buildStandardLaunchArgs` path produces a non-empty path and `maybeSpawnDaemon`'s "transcript_path required" gate passes unchanged. The daemon then runs the same file-watch path as Claude (`waitForTranscript` handles the file lagging sessionStart; no OpenCode-style collector). SessionEnd routes to `sessionEndCursor` (`StopDaemonForProvider(NameCursor, ...)`) — Cursor's daemon state lives under the `cursor` namespace, so the Claude-hardcoded `StopDaemon` would never find it. Shutdown is **hybrid**: CLI `sessionEnd` is reliable, but the IDE only fires it on window/app close (not per chat-tab), so the daemon's generic parent-PID liveness on the shared, long-lived `Cursor.app` is the primary IDE shutdown. Caveat: a long IDE session with multiple chats keeps per-session daemons alive (syncing incrementally) until window close.
+
+**Backend session commands share auth/client setup.** `helpers.go` owns the repeated auth + `pkg/http.NewClient` path and the common "session not found" translation for session fetch/list/download commands. Keep endpoint-specific behavior in the command files, not in the helper.
+
+**Retrieval commands honor per-(provider, config-dir) backends (kata szwk).** `session get-summary`/`download`/`list-files` (persistent flags on `sessionCmd`) and `retro` (its own flags) accept `--provider` + `--config-dir` to target a session living on a non-default binding. All four resolve through one path: `clientForFlags(provider, configDir)` → `provider.BindingFor` → `config.EnsureAuthenticatedFor` (via `newAuthedClientForBinding`). With both flags empty the path is byte-identical to before (default/top-level binding), so single-backend users see no change. `--config-dir` requires `--provider` (mirrors `setup`); a binding with no stored credentials surfaces `config.ErrNoBinding` with an actionable "run 'confab setup …'" message (via `withSetupHint`) — it never falls back to the default backend (leak-free, matching the daemon/hook path).
+
+**`save` honors per-(provider, config-dir) backends too (kata z0rt).** `confab save <id> --provider claude-code --config-dir C1` uploads into the C1 binding's backend. `resolveSaveContext` mirrors the retrieval path for backend resolution (`provider.BindingFor` → `config.EnsureAuthenticatedFor` → `withSetupHint`) but additionally returns the *discovery* provider via `provider.GetWithDir(name, configDir)` — claude-code-only, so a non-claude `--config-dir` errors rather than routing the backend correctly while discovering against the wrong dir. With no `--config-dir` it's the unchanged `config.EnsureAuthenticated()` default-binding path. `list` stays local-only (no backend call); only its provider coverage and output hints were fixed.
+
+**Testable function pattern.** Hook handlers extract core logic into functions that take `io.Reader`/`io.Writer` parameters (e.g., `sessionStartFromReader(r io.Reader, w io.Writer)`). Tests call these directly without needing stdin/stdout. Some functions use overridable function variables (e.g., `spawnDaemonFunc`) for test injection.
+
+## Testing
+
+```bash
+go test ./cmd/...
+```
+
+Tests use the `io.Reader`/`io.Writer` pattern and function variable overrides to test hook behavior without actual process spawning or stdin/stdout.
+
+## Dependencies
+
+**Uses:** all `pkg/` packages
+
+**Used by:** `main.go` (calls `cmd.Execute()`)

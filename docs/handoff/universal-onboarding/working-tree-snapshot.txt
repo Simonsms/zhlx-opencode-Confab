@@ -1,0 +1,89 @@
+Archived pre-version-control handoff snapshot (not the current dirty-file list)
+Captured: 2026-09-16 19:10:10 +08:00
+Scope: repository paths only; no file contents or credentials.
+Branch: main
+HEAD: f4540ab138062715b516dd04ccfd7f5ea3bf440a
+At capture time no staging or commits had been performed. The user later authorized committing and pushing this work to the new repository.
+
+git status --short --untracked-files=all:
+ M .github/workflows/ci.yaml
+ M .gitignore
+ M CLAUDE.md
+ M README.md
+ M cmd/README.md
+ M cmd/install.go
+ M cmd/spawn.go
+ M go.mod
+ M install.sh
+ M pkg/README.md
+ M pkg/daemon/README.md
+ M pkg/daemon/daemon.go
+ M pkg/daemon/state.go
+ M pkg/daemon/state_test.go
+ M pkg/git/README.md
+ M pkg/git/git.go
+ M pkg/git/git_test.go
+ M pkg/provider/README.md
+ M pkg/provider/claude.go
+ M pkg/provider/claude_test.go
+ M pkg/provider/codex.go
+ M pkg/provider/cursor.go
+ M pkg/provider/opencode.go
+ M pkg/provider/opencode_test.go
+ M pkg/provider/plugins/confab-sync.ts
+ M test/e2e/run.sh
+ M test/e2e/scenarios/already-on-path.sh
+ M test/e2e/scenarios/custom-dest.sh
+ M test/e2e/scenarios/dir-exists-not-in-path.sh
+ M test/e2e/scenarios/fresh-install.sh
+ M test/e2e/scenarios/reinstall.sh
+ M test/e2e/scenarios/shell-detection-fish.sh
+ M test/e2e/scenarios/shell-detection.sh
+?? .trellis/tasks/opencode-portable-windows/package-retest-20260916.md
+?? .trellis/tasks/opencode-portable-windows/prd.md
+?? .trellis/tasks/opencode-portable-windows/task.json
+?? .trellis/tasks/opencode-portable-windows/validation.md
+?? .trellis/tasks/universal-onboarding-s0-compatibility/prd.md
+?? .trellis/tasks/universal-onboarding-s0-compatibility/task.json
+?? .trellis/tasks/universal-onboarding-s1-first-connection/prd.md
+?? .trellis/tasks/universal-onboarding-s1-first-connection/task.json
+?? .trellis/tasks/universal-onboarding-s2-reliable-lifecycle/prd.md
+?? .trellis/tasks/universal-onboarding-s2-reliable-lifecycle/task.json
+?? .trellis/tasks/universal-onboarding-s3-managed-upgrades/prd.md
+?? .trellis/tasks/universal-onboarding-s3-managed-upgrades/task.json
+?? .trellis/tasks/universal-onboarding-s4-external-acceptance/prd.md
+?? .trellis/tasks/universal-onboarding-s4-external-acceptance/task.json
+?? .trellis/tasks/universal-onboarding-s5-intranet-delivery/prd.md
+?? .trellis/tasks/universal-onboarding-s5-intranet-delivery/task.json
+?? cmd/install_test.go
+?? cmd/procattr_unix.go
+?? cmd/procattr_windows.go
+?? confab_0.17.4_linux_amd64.tar.gz
+?? docs/design/universal-onboarding.md
+?? docs/handoff/universal-onboarding/progress.md
+?? docs/handoff/universal-onboarding/working-tree-snapshot.txt
+?? docs/prd/opencode-portable-windows.md
+?? docs/prd/universal-onboarding.md
+?? docs/windows-portable.md
+?? docs/windows.md
+?? pkg/daemon/signals_unix.go
+?? pkg/daemon/signals_windows.go
+?? pkg/daemon/stop_unix.go
+?? pkg/daemon/stop_windows.go
+?? pkg/daemon/stop_windows_test.go
+?? pkg/daemon/watchstop_unix.go
+?? pkg/daemon/watchstop_windows.go
+?? pkg/git/procattr_unix.go
+?? pkg/git/procattr_windows.go
+?? pkg/git/procattr_windows_test.go
+?? pkg/process/README.md
+?? pkg/process/process.go
+?? pkg/process/process_test.go
+?? pkg/process/process_unix.go
+?? pkg/process/process_windows.go
+?? pkg/provider/opencode_portable_test.go
+?? plans/windows-opencode-support.md
+?? scripts/build-windows-portable.ps1
+?? test/portable/git_windows_test.go
+?? test/portable/opencode-smoke.ts
+?? test/portable/opencode_test.go

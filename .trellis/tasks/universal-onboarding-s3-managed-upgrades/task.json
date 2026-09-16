@@ -1,0 +1,28 @@
+{
+  "name": "universal-onboarding-s3-managed-upgrades",
+  "title": "S3 旧版迁移、配套升级与通用契约",
+  "status": "pending",
+  "task_type": "AFK",
+  "dependencies": [
+    "universal-onboarding-s2-reliable-lifecycle"
+  ],
+  "goal": "完成可回退的迁移与配套版本管理，并用非 OpenCode 调用方验证核心协议的通用性。",
+  "requirement": "docs/prd/universal-onboarding.md",
+  "design": "docs/design/universal-onboarding.md",
+  "prd": ".trellis/tasks/universal-onboarding-s3-managed-upgrades/prd.md",
+  "scope": [
+    "packages/opencode-plugin/",
+    "pkg/onboarding/",
+    "pkg/hookconfig/",
+    "pkg/config/",
+    "cmd/update.go",
+    ".goreleaser.yaml",
+    "scripts/",
+    "test/portable/"
+  ],
+  "approval": {
+    "date": "2026-09-16",
+    "basis": "用户确认开发设计方案及推荐实施路线；环境地址、分发条件和实际版本仍按设计待落实。"
+  },
+  "verification_status": "not_run"
+}

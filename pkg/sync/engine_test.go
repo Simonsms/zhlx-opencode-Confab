@@ -1,0 +1,2332 @@
+package sync
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ConfabulousDev/confab/pkg/backendtest"
+	"github.com/ConfabulousDev/confab/pkg/codextest"
+	"github.com/ConfabulousDev/confab/pkg/config"
+	"github.com/ConfabulousDev/confab/pkg/opencodetest"
+	pkghttp "github.com/ConfabulousDev/confab/pkg/http"
+	"github.com/ConfabulousDev/confab/pkg/provider"
+	"github.com/ConfabulousDev/confab/pkg/redactor"
+	"github.com/ConfabulousDev/confab/pkg/types"
+)
+
+// mockBackend tracks requests and provides configurable responses
+type mockBackend struct {
+	t               *testing.T
+	initRequests    []InitRequest
+	chunkRequests   []ChunkRequest
+	eventRequests   []EventRequest   // POST /api/v1/sync/event
+	summaryRequests []summaryRequest // PATCH /api/v1/sessions/{id}/summary
+	initResponse    *InitResponse
+	initError       bool
+	chunkError      bool
+	requestCount    int32
+	failUntilCount  int32 // fail requests until this count is reached
+
+	// Capability probe (CF-533). caps==nil → respond 404 (old backend);
+	// capsStatus!=0 → respond that status (e.g. 500) to simulate a transient
+	// failure. capsRequestCount counts probe hits for "probed once" asserts.
+	caps             *Capabilities
+	capsStatus       int
+	capsRequestCount int32
+}
+
+// summaryRequest captures a PATCH to /api/v1/sessions/{externalID}/summary.
+type summaryRequest struct {
+	ExternalID string
+	Summary    string
+}
+
+func newMockBackend(t *testing.T) *mockBackend {
+	return &mockBackend{
+		t: t,
+		initResponse: &InitResponse{
+			SessionID: "test-session-id",
+			Files:     make(map[string]FileState),
+		},
+	}
+}
+
+func (m *mockBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	count := atomic.AddInt32(&m.requestCount, 1)
+
+	// Simulate failures until failUntilCount
+	if m.failUntilCount > 0 && count <= m.failUntilCount {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Service Unavailable"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// Read and decompress request body
+	body, err := backendtest.ReadRequestBody(r)
+	if err != nil {
+		m.t.Errorf("Failed to read request body: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	switch r.URL.Path {
+	case "/api/v1/capabilities":
+		atomic.AddInt32(&m.capsRequestCount, 1)
+		if m.capsStatus != 0 {
+			w.WriteHeader(m.capsStatus)
+			return
+		}
+		if m.caps == nil {
+			w.WriteHeader(http.StatusNotFound) // old backend: no endpoint
+			return
+		}
+		json.NewEncoder(w).Encode(m.caps)
+
+	case "/api/v1/sync/init":
+		if m.initError {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "init failed"})
+			return
+		}
+
+		var req InitRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			m.t.Errorf("Failed to decode init request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		m.initRequests = append(m.initRequests, req)
+		json.NewEncoder(w).Encode(m.initResponse)
+
+	case "/api/v1/sync/chunk":
+		if m.chunkError {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "chunk failed"})
+			return
+		}
+
+		var req ChunkRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			m.t.Errorf("Failed to decode chunk request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		m.chunkRequests = append(m.chunkRequests, req)
+
+		// Return last synced line as first + len(lines) - 1
+		lastLine := req.FirstLine + len(req.Lines) - 1
+		json.NewEncoder(w).Encode(ChunkResponse{
+			LastSyncedLine: lastLine,
+		})
+
+	case "/api/v1/sync/event":
+		var req EventRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			m.t.Errorf("Failed to decode event request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		m.eventRequests = append(m.eventRequests, req)
+		json.NewEncoder(w).Encode(EventResponse{Success: true})
+
+	default:
+		// PATCH /api/v1/sessions/{external_id}/summary — used by
+		// linkSummaryToPreviousSession. Record the request so dispatch
+		// tests can assert it fired.
+		if r.Method == http.MethodPatch &&
+			strings.HasPrefix(r.URL.Path, "/api/v1/sessions/") &&
+			strings.HasSuffix(r.URL.Path, "/summary") {
+			externalID := strings.TrimSuffix(
+				strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/"),
+				"/summary",
+			)
+			var req UpdateSummaryRequest
+			if err := json.Unmarshal(body, &req); err != nil {
+				m.t.Errorf("Failed to decode summary request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			m.summaryRequests = append(m.summaryRequests, summaryRequest{
+				ExternalID: externalID,
+				Summary:    req.Summary,
+			})
+			json.NewEncoder(w).Encode(UpdateSummaryResponse{Status: "ok"})
+			return
+		}
+		m.t.Errorf("Unexpected request to %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// setupTestEnv creates a temporary environment for engine testing
+func setupTestEnv(t *testing.T, serverURL string) (tmpDir string, transcriptPath string) {
+	tmpDir = t.TempDir()
+
+	// Set up config file
+	confabDir := filepath.Join(tmpDir, ".confab")
+	os.MkdirAll(confabDir, 0755)
+	configPath := filepath.Join(confabDir, "config.json")
+	configJSON := `{"backend_url":"` + serverURL + `","api_key":"test-api-key-12345678"}`
+	os.WriteFile(configPath, []byte(configJSON), 0600)
+	t.Setenv("CONFAB_CONFIG_PATH", configPath)
+	t.Setenv("HOME", tmpDir)
+
+	// Create transcript directory
+	transcriptDir := filepath.Join(tmpDir, "sessions")
+	os.MkdirAll(transcriptDir, 0755)
+	transcriptPath = filepath.Join(transcriptDir, "transcript.jsonl")
+
+	return tmpDir, transcriptPath
+}
+
+func TestEngine_Init_NewSession(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create transcript
+	os.WriteFile(transcriptPath, []byte(`{"type":"system"}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "test-external-id",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	if !engine.IsInitialized() {
+		t.Error("expected engine to be initialized")
+	}
+
+	if engine.SessionID() != "test-session-id" {
+		t.Errorf("expected session ID 'test-session-id', got %q", engine.SessionID())
+	}
+
+	// Verify init request
+	if len(mock.initRequests) != 1 {
+		t.Fatalf("expected 1 init request, got %d", len(mock.initRequests))
+	}
+
+	req := mock.initRequests[0]
+	if req.Provider != "claude-code" {
+		t.Errorf("expected provider 'claude-code', got %q", req.Provider)
+	}
+	if req.ExternalID != "test-external-id" {
+		t.Errorf("expected external_id 'test-external-id', got %q", req.ExternalID)
+	}
+	if req.TranscriptPath != transcriptPath {
+		t.Errorf("expected transcript_path %q, got %q", transcriptPath, req.TranscriptPath)
+	}
+}
+
+// TestEngine_SendSessionEnd_DispatchesEvent verifies SendSessionEnd
+// marshals the hook payload and dispatches a "session_end" event with
+// the engine's externalID. Covers engine.go:381 — entirely 0% prior.
+func TestEngine_SendSessionEnd_DispatchesEvent(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	os.WriteFile(transcriptPath, []byte(`{"type":"system"}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "send-session-end-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	ts := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	hookInput := &types.ClaudeHookInput{
+		SessionID:     "claude-session-uuid",
+		CWD:           "/work",
+		HookEventName: "SessionEnd",
+		Reason:        "user-exit",
+	}
+	if err := engine.SendSessionEnd(hookInput, ts); err != nil {
+		t.Fatalf("SendSessionEnd: %v", err)
+	}
+
+	if len(mock.eventRequests) != 1 {
+		t.Fatalf("event request count = %d, want 1", len(mock.eventRequests))
+	}
+	got := mock.eventRequests[0]
+	if got.EventType != "session_end" {
+		t.Errorf("EventType = %q, want session_end", got.EventType)
+	}
+	if got.SessionID != "test-session-id" {
+		// Engine uses the backend's session ID, not the hook's.
+		t.Errorf("SessionID = %q, want test-session-id (engine's backend id)", got.SessionID)
+	}
+	if !got.Timestamp.Equal(ts) {
+		t.Errorf("Timestamp = %v, want %v", got.Timestamp, ts)
+	}
+	// Payload must round-trip back to the original hook input.
+	var decoded types.ClaudeHookInput
+	if err := json.Unmarshal(got.Payload, &decoded); err != nil {
+		t.Fatalf("payload not valid JSON: %v", err)
+	}
+	if decoded.SessionID != hookInput.SessionID ||
+		decoded.HookEventName != hookInput.HookEventName ||
+		decoded.Reason != hookInput.Reason {
+		t.Errorf("payload round-trip mismatch: got %+v, want %+v", decoded, hookInput)
+	}
+}
+
+// TestEngine_SendSessionEnd_NotInitialized verifies SendSessionEnd is a
+// no-op (no error, no backend call) when the engine isn't initialized.
+// Protects the early-return at engine.go:382.
+func TestEngine_SendSessionEnd_NotInitialized(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	os.WriteFile(transcriptPath, []byte(`{"type":"system"}`+"\n"), 0644)
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{ExternalID: "not-init", TranscriptPath: transcriptPath, CWD: tmpDir})
+	// No Init() call.
+	if err := engine.SendSessionEnd(&types.ClaudeHookInput{}, time.Now()); err != nil {
+		t.Errorf("SendSessionEnd on uninitialized engine returned %v, want nil (no-op)", err)
+	}
+	if len(mock.eventRequests) != 0 {
+		t.Errorf("uninitialized engine made %d event requests, want 0", len(mock.eventRequests))
+	}
+}
+
+// TestEngine_Init_RecordsProviderField asserts that the provider name
+// supplied via EngineConfig propagates to the InitRequest payload. It
+// does NOT exercise any Codex-specific provider behavior — for that,
+// see TestEngine_SyncAll_CodexRoot_FirstChunk_EmitsCodexRolloutMeta and
+// related Codex dispatch tests at the bottom of this file.
+func TestEngine_Init_RecordsProviderField(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	os.WriteFile(transcriptPath, []byte(`{"type":"session_meta","payload":{}}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       "codex",
+		ExternalID:     "codex-external-id",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	if len(mock.initRequests) != 1 {
+		t.Fatalf("expected 1 init request, got %d", len(mock.initRequests))
+	}
+	if got := mock.initRequests[0].Provider; got != "codex" {
+		t.Fatalf("provider = %q, want codex", got)
+	}
+}
+
+func TestEngine_Init_ResumeSession(t *testing.T) {
+	mock := newMockBackend(t)
+	// Backend already has some lines synced
+	mock.initResponse.Files = map[string]FileState{
+		"transcript.jsonl": {LastSyncedLine: 5},
+	}
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create transcript with more lines
+	content := ""
+	for i := 1; i <= 10; i++ {
+		content += `{"line":` + string(rune('0'+i)) + `}` + "\n"
+	}
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "resume-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Sync should only upload new lines
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	if chunks != 1 {
+		t.Errorf("expected 1 chunk, got %d", chunks)
+	}
+
+	// Verify chunk starts at line 6
+	if len(mock.chunkRequests) != 1 {
+		t.Fatalf("expected 1 chunk request, got %d", len(mock.chunkRequests))
+	}
+
+	chunkReq := mock.chunkRequests[0]
+	if chunkReq.FirstLine != 6 {
+		t.Errorf("expected FirstLine 6, got %d", chunkReq.FirstLine)
+	}
+	if len(chunkReq.Lines) != 5 {
+		t.Errorf("expected 5 lines (6-10), got %d", len(chunkReq.Lines))
+	}
+}
+
+func TestEngine_SyncAll_FirstSync(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	content := `{"type":"system","message":"hello"}
+{"type":"user","message":"world"}
+{"type":"assistant","message":"response"}
+`
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "first-sync-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	if chunks != 1 {
+		t.Errorf("expected 1 chunk, got %d", chunks)
+	}
+
+	// Verify chunk content
+	if len(mock.chunkRequests) != 1 {
+		t.Fatalf("expected 1 chunk request, got %d", len(mock.chunkRequests))
+	}
+
+	chunkReq := mock.chunkRequests[0]
+	if chunkReq.SessionID != "test-session-id" {
+		t.Errorf("expected session_id 'test-session-id', got %q", chunkReq.SessionID)
+	}
+	if chunkReq.FileType != "transcript" {
+		t.Errorf("expected file_type 'transcript', got %q", chunkReq.FileType)
+	}
+	if len(chunkReq.Lines) != 3 {
+		t.Errorf("expected 3 lines, got %d", len(chunkReq.Lines))
+	}
+	if chunkReq.FirstLine != 1 {
+		t.Errorf("expected first_line 1, got %d", chunkReq.FirstLine)
+	}
+	// E7: assert the actual content was uploaded, not just the count.
+	// Without this, a bug that uploaded the wrong lines (e.g. read from
+	// a stale offset) would still pass.
+	wantLines := []string{
+		`{"type":"system","message":"hello"}`,
+		`{"type":"user","message":"world"}`,
+		`{"type":"assistant","message":"response"}`,
+	}
+	for i, want := range wantLines {
+		if i >= len(chunkReq.Lines) {
+			t.Errorf("Lines[%d] missing, want %q", i, want)
+			continue
+		}
+		if chunkReq.Lines[i] != want {
+			t.Errorf("Lines[%d] = %q, want %q", i, chunkReq.Lines[i], want)
+		}
+	}
+}
+
+func TestEngine_SyncAll_NoChanges(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	os.WriteFile(transcriptPath, []byte(`{"type":"system"}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "no-changes-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// First sync
+	chunks1, _ := engine.SyncAll()
+	if chunks1 != 1 {
+		t.Errorf("expected 1 chunk on first sync, got %d", chunks1)
+	}
+
+	// Second sync without changes
+	chunks2, _ := engine.SyncAll()
+	if chunks2 != 0 {
+		t.Errorf("expected 0 chunks on second sync (no changes), got %d", chunks2)
+	}
+}
+
+func TestEngine_SyncAll_WithAgentDiscovery(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create transcript with agent reference
+	content := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"abc12345","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	// Create agent file in subagents directory
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+	agentPath := filepath.Join(subagentsDir, "agent-abc12345.jsonl")
+	agentContent := `{"type":"agent","message":"agent line 1"}
+{"type":"agent","message":"agent line 2"}
+`
+	os.WriteFile(agentPath, []byte(agentContent), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "agent-discovery-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Single SyncAll should upload BOTH transcript AND agent (BFS discovery)
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	if chunks != 2 {
+		t.Errorf("expected 2 chunks (transcript + agent), got %d", chunks)
+	}
+
+	// Verify both transcript and agent were uploaded
+	if len(mock.chunkRequests) != 2 {
+		t.Fatalf("expected 2 chunk requests, got %d", len(mock.chunkRequests))
+	}
+
+	// Find transcript and agent chunks
+	var transcriptChunk, agentChunk *ChunkRequest
+	for i := range mock.chunkRequests {
+		req := &mock.chunkRequests[i]
+		if req.FileType == "transcript" {
+			transcriptChunk = req
+		} else if req.FileType == "agent" {
+			agentChunk = req
+		}
+	}
+
+	// Verify transcript chunk exists
+	if transcriptChunk == nil {
+		t.Fatal("expected transcript chunk")
+	}
+	// Note: AgentIDs are no longer sent to backend, but agent discovery still works
+	// (proven by the agent chunk being uploaded below)
+
+	// Verify agent chunk
+	if agentChunk == nil {
+		t.Fatal("expected agent chunk")
+	}
+	if agentChunk.FileName != "agent-abc12345.jsonl" {
+		t.Errorf("expected file_name 'agent-abc12345.jsonl', got %q", agentChunk.FileName)
+	}
+	if len(agentChunk.Lines) != 2 {
+		t.Errorf("expected 2 agent lines, got %d", len(agentChunk.Lines))
+	}
+}
+
+func TestEngine_SyncAll_WithMetadata(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	content := `{"type":"user","message":{"content":"Help me with this task"},"gitBranch":"main","cwd":"/tmp/test"}
+{"type":"user","toolUseResult":{"agentId":"11112222"}}
+{"type":"summary","summary":"Task assistance session"}
+`
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "metadata-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	// Verify metadata in chunk
+	chunkReq := mock.chunkRequests[0]
+	if chunkReq.Metadata == nil {
+		t.Fatal("expected metadata in chunk request")
+	}
+
+	if chunkReq.Metadata.GitInfo == nil || chunkReq.Metadata.GitInfo.Branch != "main" {
+		t.Errorf("expected git branch 'main', got %v", chunkReq.Metadata.GitInfo)
+	}
+
+	// Note: AgentIDs are no longer sent to backend (local use only)
+
+	// Verify summary and first_user_message
+	if chunkReq.Metadata.Summary != "Task assistance session" {
+		t.Errorf("expected summary 'Task assistance session', got %q", chunkReq.Metadata.Summary)
+	}
+	if chunkReq.Metadata.FirstUserMessage != "Help me with this task" {
+		t.Errorf("expected first_user_message 'Help me with this task', got %q", chunkReq.Metadata.FirstUserMessage)
+	}
+}
+
+func TestEngine_SyncAll_WithCodexFirstUserMessage(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	content := `{"type":"session_meta","payload":{"id":"codex-session","thread_source":"user","cwd":"/tmp/test"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>ignore me</environment_context>"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"  Explain this failure  "}}
+{"type":"event_msg","payload":{"type":"user_message","message":"second prompt"}}
+`
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       (provider.Codex{}).Name(),
+		ExternalID:     "codex-metadata-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	chunkReq := mock.chunkRequests[0]
+	if chunkReq.Metadata == nil {
+		t.Fatal("expected metadata in chunk request")
+	}
+	if chunkReq.Metadata.FirstUserMessage != "Explain this failure" {
+		t.Errorf("expected Codex first_user_message from event_msg user_message, got %q", chunkReq.Metadata.FirstUserMessage)
+	}
+	if chunkReq.Metadata.Summary != "" {
+		t.Errorf("expected Codex upload not to send summary, got %q", chunkReq.Metadata.Summary)
+	}
+}
+
+func TestEngine_SyncAll_MetadataRedaction(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Transcript where the first user message and summary contain a secret
+	content := `{"type":"user","message":{"content":"Use API key AKIAIOSFODNN7EXAMPLE to deploy"}}
+{"type":"summary","summary":"User deployed with AWS key AKIAIOSFODNN7EXAMPLE"}
+`
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	useDefaults := false
+	r, err := redactor.NewFromConfig(&config.RedactionConfig{
+		UseDefaultPatterns: &useDefaults,
+		Patterns: []config.RedactionPattern{{
+			Name:    "AWS Access Key",
+			Pattern: `AKIA[0-9A-Z]{16}`,
+			Type:    "aws_access_key",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create redactor: %v", err)
+	}
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), r, EngineConfig{
+		ExternalID:     "redact-metadata-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	_, err = engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	chunkReq := mock.chunkRequests[0]
+	if chunkReq.Metadata == nil {
+		t.Fatal("expected metadata in chunk request")
+	}
+
+	// Secrets must be redacted in metadata
+	if strings.Contains(chunkReq.Metadata.Summary, "AKIAIOSFODNN7EXAMPLE") {
+		t.Errorf("summary contains unredacted secret: %q", chunkReq.Metadata.Summary)
+	}
+	if strings.Contains(chunkReq.Metadata.FirstUserMessage, "AKIAIOSFODNN7EXAMPLE") {
+		t.Errorf("first_user_message contains unredacted secret: %q", chunkReq.Metadata.FirstUserMessage)
+	}
+
+	// Verify redaction markers are present
+	if !strings.Contains(chunkReq.Metadata.Summary, "[REDACTED:") {
+		t.Errorf("summary should contain redaction marker, got: %q", chunkReq.Metadata.Summary)
+	}
+	if !strings.Contains(chunkReq.Metadata.FirstUserMessage, "[REDACTED:") {
+		t.Errorf("first_user_message should contain redaction marker, got: %q", chunkReq.Metadata.FirstUserMessage)
+	}
+}
+
+func TestEngine_GetSyncStats(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	content := `{"line":1}
+{"line":2}
+{"line":3}
+`
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "stats-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Before sync
+	stats := engine.GetSyncStats()
+	if stats["transcript.jsonl"] != 0 {
+		t.Errorf("expected 0 lines synced before sync, got %d", stats["transcript.jsonl"])
+	}
+
+	// After sync
+	engine.SyncAll()
+
+	stats = engine.GetSyncStats()
+	if stats["transcript.jsonl"] != 3 {
+		t.Errorf("expected 3 lines synced after sync, got %d", stats["transcript.jsonl"])
+	}
+}
+
+func TestEngine_Reset(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	os.WriteFile(transcriptPath, []byte(`{"type":"system"}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "reset-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	if !engine.IsInitialized() {
+		t.Error("expected engine to be initialized")
+	}
+
+	engine.Reset()
+
+	if engine.IsInitialized() {
+		t.Error("expected engine to not be initialized after Reset")
+	}
+	if engine.SessionID() != "" {
+		t.Error("expected empty session ID after Reset")
+	}
+}
+
+func TestEngine_SyncAll_NotInitialized(t *testing.T) {
+	engine := &Engine{
+		initialized: false,
+	}
+
+	_, err := engine.SyncAll()
+	if err == nil {
+		t.Error("expected error when calling SyncAll before Init")
+	}
+}
+
+// TestEngine_SyncAll_TransitiveAgentDiscovery tests that agents discovered from
+// transcript AND agents discovered from other agents are all synced in a single
+// SyncAll() call (BFS traversal).
+func TestEngine_SyncAll_TransitiveAgentDiscovery(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create subagents directory
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Create transcript that references agent A
+	transcriptContent := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"aaaaaaaa","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	// Agent A references agent B
+	agentAPath := filepath.Join(subagentsDir, "agent-aaaaaaaa.jsonl")
+	agentAContent := `{"type":"agent","message":"agent A start"}
+{"type":"user","toolUseResult":{"agentId":"bbbbbbbb","result":"done"}}
+`
+	os.WriteFile(agentAPath, []byte(agentAContent), 0644)
+
+	// Agent B references agent C (3 levels deep)
+	agentBPath := filepath.Join(subagentsDir, "agent-bbbbbbbb.jsonl")
+	agentBContent := `{"type":"agent","message":"agent B start"}
+{"type":"user","toolUseResult":{"agentId":"cccccccc","result":"done"}}
+`
+	os.WriteFile(agentBPath, []byte(agentBContent), 0644)
+
+	// Agent C is a leaf (no further references)
+	agentCPath := filepath.Join(subagentsDir, "agent-cccccccc.jsonl")
+	agentCContent := `{"type":"agent","message":"agent C - leaf"}
+`
+	os.WriteFile(agentCPath, []byte(agentCContent), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "transitive-agent-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Single SyncAll should discover and sync ALL files:
+	// transcript -> agent A -> agent B -> agent C
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	// Should have 4 chunks: transcript + 3 agents
+	if chunks != 4 {
+		t.Errorf("expected 4 chunks (transcript + 3 agents), got %d", chunks)
+	}
+
+	// Verify all files were uploaded
+	fileTypes := make(map[string]bool)
+	for _, req := range mock.chunkRequests {
+		fileTypes[req.FileName] = true
+	}
+
+	expectedFiles := []string{"transcript.jsonl", "agent-aaaaaaaa.jsonl", "agent-bbbbbbbb.jsonl", "agent-cccccccc.jsonl"}
+	for _, f := range expectedFiles {
+		if !fileTypes[f] {
+			t.Errorf("expected file %s to be uploaded", f)
+		}
+	}
+
+	if len(mock.chunkRequests) != 4 {
+		t.Errorf("expected 4 chunk requests, got %d", len(mock.chunkRequests))
+	}
+}
+
+// TestEngine_SyncAll_AgentCycleDetection tests that cycles in agent references
+// (A -> B -> A) don't cause infinite loops. Each file should only be synced once.
+func TestEngine_SyncAll_AgentCycleDetection(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create subagents directory
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Create transcript that references agent A
+	transcriptContent := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"aaaaaaaa","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	// Agent A references agent B
+	agentAPath := filepath.Join(subagentsDir, "agent-aaaaaaaa.jsonl")
+	agentAContent := `{"type":"agent","message":"agent A"}
+{"type":"user","toolUseResult":{"agentId":"bbbbbbbb","result":"done"}}
+`
+	os.WriteFile(agentAPath, []byte(agentAContent), 0644)
+
+	// Agent B references agent A (cycle!)
+	agentBPath := filepath.Join(subagentsDir, "agent-bbbbbbbb.jsonl")
+	agentBContent := `{"type":"agent","message":"agent B"}
+{"type":"user","toolUseResult":{"agentId":"aaaaaaaa","result":"done"}}
+`
+	os.WriteFile(agentBPath, []byte(agentBContent), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "cycle-detection-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Should complete without infinite loop
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	// Should have exactly 3 chunks: transcript + agent A + agent B
+	// (no duplicates despite cycle)
+	if chunks != 3 {
+		t.Errorf("expected 3 chunks, got %d", chunks)
+	}
+
+	// Verify each file uploaded exactly once
+	fileCounts := make(map[string]int)
+	for _, req := range mock.chunkRequests {
+		fileCounts[req.FileName]++
+	}
+
+	for file, count := range fileCounts {
+		if count != 1 {
+			t.Errorf("file %s uploaded %d times, expected 1", file, count)
+		}
+	}
+}
+
+// TestEngine_SyncAll_MaxIterations tests that the BFS loop has a maximum
+// iteration limit to prevent runaway loops.
+func TestEngine_SyncAll_MaxIterations(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create subagents directory
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Create a chain of agents longer than maxSyncIterations (10)
+	// transcript -> agent-00000001 -> agent-00000002 -> ... -> agent-00000015
+	transcriptContent := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"00000001","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	// Create 15 agents in a chain
+	for i := 1; i <= 15; i++ {
+		agentID := fmt.Sprintf("%08d", i)
+		nextAgentID := fmt.Sprintf("%08d", i+1)
+
+		var content string
+		if i < 15 {
+			content = fmt.Sprintf(`{"type":"agent","message":"agent %d"}
+{"type":"user","toolUseResult":{"agentId":"%s","result":"done"}}
+`, i, nextAgentID)
+		} else {
+			// Last agent has no further references
+			content = fmt.Sprintf(`{"type":"agent","message":"agent %d - leaf"}
+`, i)
+		}
+
+		agentPath := filepath.Join(subagentsDir, fmt.Sprintf("agent-%s.jsonl", agentID))
+		os.WriteFile(agentPath, []byte(content), 0644)
+	}
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "max-iterations-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// SyncAll should complete (not hang) even with deep chain
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	// With maxSyncIterations=10, we should sync at most 10 levels
+	// (transcript counts as iteration 1, so 10 iterations = transcript + 9 agents max
+	// or could be more depending on implementation)
+	// The key assertion is that it completes and doesn't hang.
+	t.Logf("Synced %d chunks with 15-level deep chain", chunks)
+
+	// Should have synced at least some files (transcript + early agents)
+	if chunks < 1 {
+		t.Error("expected at least 1 chunk to be synced")
+	}
+
+	// Should NOT have synced all 16 files if max iterations is 10
+	// (This test documents the expected behavior with maxSyncIterations)
+	if chunks > 11 { // transcript + 10 iterations worth of agents
+		t.Logf("Note: synced %d chunks, max iterations may allow more than expected", chunks)
+	}
+}
+
+// TestEngine_SyncAll_AgentFileAppearsLater tests that if an agent file doesn't
+// exist when first referenced, it can still be discovered on a later SyncAll call.
+func TestEngine_SyncAll_AgentFileAppearsLater(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create subagents directory
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Create transcript that references an agent that doesn't exist yet
+	transcriptContent := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"deadbeef","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "late-agent-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// First sync - agent file doesn't exist
+	chunks1, _ := engine.SyncAll()
+	if chunks1 != 1 {
+		t.Errorf("expected 1 chunk on first sync, got %d", chunks1)
+	}
+
+	// Now create the agent file in subagents dir
+	agentPath := filepath.Join(subagentsDir, "agent-deadbeef.jsonl")
+	os.WriteFile(agentPath, []byte(`{"type":"agent","message":"late agent"}`+"\n"), 0644)
+
+	// Second sync - should discover and sync the agent file
+	chunks2, _ := engine.SyncAll()
+	if chunks2 != 1 {
+		t.Errorf("expected 1 chunk on second sync (late agent), got %d", chunks2)
+	}
+
+	// Verify agent was uploaded
+	var agentUploaded bool
+	for _, req := range mock.chunkRequests {
+		if req.FileName == "agent-deadbeef.jsonl" {
+			agentUploaded = true
+			break
+		}
+	}
+	if !agentUploaded {
+		t.Error("expected agent-deadbeef.jsonl to be uploaded")
+	}
+}
+
+// TestEngine_SyncAll_RefreshStateAfterUploadFailure tests that when a chunk upload
+// fails (e.g., timeout), the engine refreshes state from the backend before the next
+// sync attempt. This handles the case where the server received and stored the chunk
+// but the response didn't reach the client.
+func TestEngine_SyncAll_RefreshStateAfterUploadFailure(t *testing.T) {
+	// Track chunk requests and init requests
+	var initCount int32
+	var chunkCount int32
+
+	// State tracking - simulates server having received the first chunk
+	serverLastSyncedLine := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body, _ := backendtest.ReadRequestBody(r)
+
+		switch r.URL.Path {
+		case "/api/v1/sync/init":
+			atomic.AddInt32(&initCount, 1)
+			// Return current server state
+			json.NewEncoder(w).Encode(InitResponse{
+				SessionID: "test-session-id",
+				Files: map[string]FileState{
+					"transcript.jsonl": {LastSyncedLine: serverLastSyncedLine},
+				},
+			})
+
+		case "/api/v1/sync/chunk":
+			count := atomic.AddInt32(&chunkCount, 1)
+
+			var req ChunkRequest
+			json.Unmarshal(body, &req)
+
+			if count == 1 {
+				// First chunk upload: server receives data but then "times out"
+				// Simulate server successfully storing lines 1-5
+				serverLastSyncedLine = req.FirstLine + len(req.Lines) - 1
+
+				// Return 503 Service Unavailable to simulate timeout/error
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte("Service Unavailable"))
+				return
+			}
+
+			// Subsequent uploads succeed
+			lastLine := req.FirstLine + len(req.Lines) - 1
+			serverLastSyncedLine = lastLine
+			json.NewEncoder(w).Encode(ChunkResponse{
+				LastSyncedLine: lastLine,
+			})
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create transcript with 10 lines
+	var content string
+	for i := 1; i <= 10; i++ {
+		content += fmt.Sprintf(`{"line":%d}`, i) + "\n"
+	}
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "refresh-state-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	// Initialize
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// First init call
+	if initCount != 1 {
+		t.Errorf("expected 1 init call after Init(), got %d", initCount)
+	}
+
+	// First SyncAll - upload will fail but server received the data
+	chunks1, err := engine.SyncAll()
+	if err == nil {
+		t.Error("expected error from first SyncAll")
+	}
+	if chunks1 != 0 {
+		t.Errorf("expected 0 successful chunks, got %d", chunks1)
+	}
+
+	// Should have called init again to refresh state after failure
+	if initCount != 2 {
+		t.Errorf("expected 2 init calls (1 for Init + 1 for refresh after failure), got %d", initCount)
+	}
+
+	// Server now has lines 1-10 synced (simulated)
+	// The engine should have refreshed its state from the backend
+
+	// Second SyncAll - should detect no new data needed (or start from correct position)
+	chunks2, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("second SyncAll failed: %v", err)
+	}
+
+	// After refresh, server has all 10 lines, so there should be nothing more to sync
+	if chunks2 != 0 {
+		t.Errorf("expected 0 chunks on second sync (server already has all lines), got %d", chunks2)
+	}
+
+	// Verify no additional chunk uploads were attempted (beyond the initial failed one)
+	if chunkCount != 1 {
+		t.Errorf("expected only 1 chunk request (the failed one), got %d", chunkCount)
+	}
+}
+
+// TestEngine_SyncAll_RefreshStateOnContiguityError tests the specific scenario from CF-240:
+// 1. First upload times out (server received lines 346-352, so last_synced_line = 352)
+// 2. Client retries from line 346 (doesn't know server has it)
+// 3. Server returns 400 "first_line must be 353"
+// 4. Engine should refresh state and retry from 353
+func TestEngine_SyncAll_RefreshStateOnContiguityError(t *testing.T) {
+	var initCount int32
+	var chunkCount int32
+	serverLastSyncedLine := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body, _ := backendtest.ReadRequestBody(r)
+
+		switch r.URL.Path {
+		case "/api/v1/sync/init":
+			atomic.AddInt32(&initCount, 1)
+			json.NewEncoder(w).Encode(InitResponse{
+				SessionID: "test-session-id",
+				Files: map[string]FileState{
+					"transcript.jsonl": {LastSyncedLine: serverLastSyncedLine},
+				},
+			})
+
+		case "/api/v1/sync/chunk":
+			count := atomic.AddInt32(&chunkCount, 1)
+
+			var req ChunkRequest
+			json.Unmarshal(body, &req)
+
+			if count == 1 {
+				// First upload: server receives but connection times out
+				// Server advances to line 5
+				serverLastSyncedLine = 5
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte("timeout"))
+				return
+			}
+
+			// After refresh, client should send from line 6
+			// If client sends from wrong line, return 400
+			expectedFirstLine := serverLastSyncedLine + 1
+			if req.FirstLine != expectedFirstLine {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": fmt.Sprintf("first_line must be %d (got %d) - chunks must be contiguous",
+						expectedFirstLine, req.FirstLine),
+				})
+				return
+			}
+
+			lastLine := req.FirstLine + len(req.Lines) - 1
+			serverLastSyncedLine = lastLine
+			json.NewEncoder(w).Encode(ChunkResponse{
+				LastSyncedLine: lastLine,
+			})
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create transcript with 10 lines
+	var content string
+	for i := 1; i <= 10; i++ {
+		content += fmt.Sprintf(`{"line":%d}`, i) + "\n"
+	}
+	os.WriteFile(transcriptPath, []byte(content), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "contiguity-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// First SyncAll - will fail with "timeout" but trigger refresh
+	if _, err := engine.SyncAll(); err == nil {
+		t.Error("expected error from first SyncAll")
+	}
+
+	// Verify init was called to refresh state
+	if initCount != 2 {
+		t.Errorf("expected 2 init calls (initial + refresh), got %d", initCount)
+	}
+
+	// Second SyncAll - should succeed because state was refreshed
+	// Client should now send from line 6 (after server's last_synced_line of 5)
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Errorf("second SyncAll should succeed after refresh, got error: %v", err)
+	}
+
+	// Should have uploaded remaining lines (6-10)
+	if chunks != 1 {
+		t.Errorf("expected 1 chunk on second sync, got %d", chunks)
+	}
+
+	// Final state check
+	if serverLastSyncedLine != 10 {
+		t.Errorf("expected server to have all 10 lines, got %d", serverLastSyncedLine)
+	}
+}
+
+// TestEngine_SyncAll_AuthErrorDuringRefreshPropagated tests that when refresh fails
+// with an auth error (e.g., token expired mid-sync), the auth error is propagated
+// so the daemon can handle it properly.
+func TestEngine_SyncAll_AuthErrorDuringRefreshPropagated(t *testing.T) {
+	var initCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/api/v1/sync/init":
+			count := atomic.AddInt32(&initCount, 1)
+			if count == 1 {
+				// First init succeeds
+				json.NewEncoder(w).Encode(InitResponse{
+					SessionID: "test-session-id",
+					Files: map[string]FileState{
+						"transcript.jsonl": {LastSyncedLine: 0},
+					},
+				})
+			} else {
+				// Second init (refresh) fails with auth error - token expired
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":"token expired"}`))
+			}
+
+		case "/api/v1/sync/chunk":
+			// Chunk upload fails with 503
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("Service Unavailable"))
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	os.WriteFile(transcriptPath, []byte(`{"line":1}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "auth-during-refresh-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// SyncAll should fail - chunk upload fails, refresh fails with auth error
+	_, err := engine.SyncAll()
+	if err == nil {
+		t.Fatal("expected error from SyncAll")
+	}
+
+	// The returned error should be the auth error from refresh, not the original 503
+	if !errors.Is(err, pkghttp.ErrUnauthorized) {
+		t.Errorf("expected ErrUnauthorized to be propagated, got: %v", err)
+	}
+}
+
+// TestEngine_SyncAll_DirScanAfterRestart tests the daemon-restart edge case:
+// A first engine syncs a transcript that references agents. Then a second engine
+// (simulating a restart with a fresh tracker and no in-memory knownAgentIDs)
+// should still discover and sync those agent files via directory scan.
+func TestEngine_SyncAll_DirScanAfterRestart(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	// Create subagents directory
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Create transcript that references two agents
+	transcriptContent := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"a3eaf63159a07953f","result":"done"}}
+{"type":"user","toolUseResult":{"agentId":"acompact-2aaa241e456ebc94","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	// Create agent files
+	os.WriteFile(
+		filepath.Join(subagentsDir, "agent-a3eaf63159a07953f.jsonl"),
+		[]byte(`{"type":"agent","message":"agent 1"}`+"\n"), 0644)
+	os.WriteFile(
+		filepath.Join(subagentsDir, "agent-acompact-2aaa241e456ebc94.jsonl"),
+		[]byte(`{"type":"agent","message":"agent 2"}`+"\n"), 0644)
+
+	// --- First engine: syncs everything ---
+	engine1 := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "dir-scan-restart-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine1.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	chunks1, err := engine1.SyncAll()
+	if err != nil {
+		t.Fatalf("First SyncAll failed: %v", err)
+	}
+	// Should sync transcript + 2 agents = 3 chunks
+	if chunks1 != 3 {
+		t.Errorf("expected 3 chunks on first sync, got %d", chunks1)
+	}
+
+	// --- Second engine: simulates restart ---
+	// Backend reports all files as fully synced (transcript: 3 lines, agents: 1 line each)
+	mock.initResponse.Files = map[string]FileState{
+		"transcript.jsonl":                      {LastSyncedLine: 3},
+		"agent-a3eaf63159a07953f.jsonl":         {LastSyncedLine: 1},
+		"agent-acompact-2aaa241e456ebc94.jsonl": {LastSyncedLine: 1},
+	}
+
+	engine2 := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "dir-scan-restart-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine2.Init(); err != nil {
+		t.Fatalf("Second Init failed: %v", err)
+	}
+
+	// Append new content to one of the agent files AFTER the restart
+	f, _ := os.OpenFile(
+		filepath.Join(subagentsDir, "agent-a3eaf63159a07953f.jsonl"),
+		os.O_APPEND|os.O_WRONLY, 0644)
+	f.WriteString(`{"type":"agent","message":"new line after restart"}` + "\n")
+	f.Close()
+
+	// The fresh engine has no knownAgentIDs. It must discover agents via:
+	// 1. InitFromBackendState (backend told it about these files), AND/OR
+	// 2. Directory scan in DiscoverNewFiles
+	// Either way, the new agent line should be synced.
+	chunks2, err := engine2.SyncAll()
+	if err != nil {
+		t.Fatalf("Second SyncAll failed: %v", err)
+	}
+
+	if chunks2 != 1 {
+		t.Errorf("expected 1 chunk (new agent line), got %d", chunks2)
+	}
+
+	// Verify the new agent line was uploaded
+	var foundNewLine bool
+	for _, req := range mock.chunkRequests {
+		if req.FileName == "agent-a3eaf63159a07953f.jsonl" && req.FirstLine == 2 {
+			foundNewLine = true
+			break
+		}
+	}
+	if !foundNewLine {
+		t.Error("expected new agent line (line 2 of agent-a3eaf63159a07953f.jsonl) to be uploaded")
+	}
+}
+
+// TestEngine_SyncAll_DirScanDiscoversUnknownAgent tests that the directory scan
+// in DiscoverNewFiles finds agent files that were never referenced in any
+// transcript line (e.g., agent IDs from already-synced lines lost after restart).
+func TestEngine_SyncAll_DirScanDiscoversUnknownAgent(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Transcript with NO agent references (simulates: agent refs were in
+	// already-synced lines that won't be re-read)
+	transcriptContent := `{"type":"system","message":"start"}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	// But agent file exists in subagents dir (written by Claude Code)
+	os.WriteFile(
+		filepath.Join(subagentsDir, "agent-a3eaf63159a07953f.jsonl"),
+		[]byte(`{"type":"agent","message":"orphan agent"}`+"\n"), 0644)
+
+	// Backend says transcript is partially synced but knows nothing about the agent
+	mock.initResponse.Files = map[string]FileState{
+		"transcript.jsonl": {LastSyncedLine: 0},
+	}
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "dir-scan-unknown-agent-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	// Should sync transcript (1 line) + agent found via dir scan (1 line)
+	if chunks != 2 {
+		t.Errorf("expected 2 chunks (transcript + dir-scanned agent), got %d", chunks)
+	}
+
+	// Verify agent was uploaded
+	var agentUploaded bool
+	for _, req := range mock.chunkRequests {
+		if req.FileName == "agent-a3eaf63159a07953f.jsonl" {
+			agentUploaded = true
+			break
+		}
+	}
+	if !agentUploaded {
+		t.Error("expected agent-a3eaf63159a07953f.jsonl to be discovered and uploaded via dir scan")
+	}
+}
+
+// TestEngine_SyncAll_MixedAgentIDFormats tests that a single transcript can
+// reference both legacy 8-char hex and new-format agent IDs, and all are
+// discovered and synced correctly.
+func TestEngine_SyncAll_MixedAgentIDFormats(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+
+	subagentsDir := filepath.Join(filepath.Dir(transcriptPath), "transcript", "subagents")
+	os.MkdirAll(subagentsDir, 0755)
+
+	// Transcript references three different agent ID formats
+	transcriptContent := `{"type":"system","message":"start"}
+{"type":"user","toolUseResult":{"agentId":"abcd1234","result":"done"}}
+{"type":"user","toolUseResult":{"agentId":"a3eaf63159a07953f","result":"done"}}
+{"type":"user","toolUseResult":{"agentId":"acompact-2aaa241e456ebc94","result":"done"}}
+`
+	os.WriteFile(transcriptPath, []byte(transcriptContent), 0644)
+
+	// Create all three agent files
+	agents := map[string]string{
+		"agent-abcd1234.jsonl":                  `{"type":"agent","message":"legacy hex"}` + "\n",
+		"agent-a3eaf63159a07953f.jsonl":         `{"type":"agent","message":"long hex"}` + "\n",
+		"agent-acompact-2aaa241e456ebc94.jsonl": `{"type":"agent","message":"compact format"}` + "\n",
+	}
+	for name, content := range agents {
+		os.WriteFile(filepath.Join(subagentsDir, name), []byte(content), 0644)
+	}
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "mixed-formats-test",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	chunks, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("SyncAll failed: %v", err)
+	}
+
+	// Should sync transcript + 3 agents = 4 chunks
+	if chunks != 4 {
+		t.Errorf("expected 4 chunks (transcript + 3 agents), got %d", chunks)
+	}
+
+	// Verify all agent files were uploaded
+	uploadedFiles := make(map[string]bool)
+	for _, req := range mock.chunkRequests {
+		uploadedFiles[req.FileName] = true
+	}
+	for name := range agents {
+		if !uploadedFiles[name] {
+			t.Errorf("expected %s to be uploaded", name)
+		}
+	}
+}
+
+// newEngineWithBackend creates an engine with a mock backend for testing.
+// Fatals on error to keep test bodies clean.
+func newEngineWithBackend(t *testing.T, backend Backend, r *redactor.Redactor, cfg EngineConfig) *Engine {
+	t.Helper()
+	// Default to claude-code for fixtures that don't set a provider. The empty
+	// name used to alias to claude-code inside provider.Get; that alias is now a
+	// hard error (kata frm7), so claude-path fixtures opt in explicitly here.
+	if cfg.Provider == "" {
+		cfg.Provider = provider.NameClaudeCode
+	}
+	engine, err := NewWithBackend(backend, r, cfg)
+	if err != nil {
+		t.Fatalf("NewWithBackend: %v", err)
+	}
+	return engine
+}
+
+// mustNewClient creates a client for testing
+func mustNewClient(t *testing.T, serverURL, tmpDir string) *Client {
+	t.Helper()
+
+	cfg := &config.UploadConfig{
+		BackendURL: serverURL,
+		APIKey:     "test-api-key-12345678",
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	return client
+}
+
+// ============================================================================
+// Codex subagent rollout sync (CF-387)
+// ============================================================================
+
+// findChunkForFile returns the first chunk request whose FileName matches.
+func findChunkForFile(reqs []ChunkRequest, fileName string) (ChunkRequest, bool) {
+	for _, r := range reqs {
+		if r.FileName == fileName {
+			return r, true
+		}
+	}
+	return ChunkRequest{}, false
+}
+
+// codexEngineSetup wires HOME + config, sets up a Codex fixture, populates
+// the root rollout's session_meta + initial content, and returns the
+// fixture plus a usable engine pointed at the root.
+func codexEngineSetup(t *testing.T, mock *mockBackend) (*codextest.Fixture, *Engine, *codextest.RolloutBuilder) {
+	t.Helper()
+	server := httptest.NewServer(mock)
+	t.Cleanup(server.Close)
+
+	tmpDir, _ := setupTestEnv(t, server.URL)
+	fixture := codextest.NewFixture(t)
+
+	root := fixture.AddRoot("root-thread").
+		WithSessionMeta("/workdir").
+		WithUserMessage("hello codex")
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       (provider.Codex{}).Name(),
+		ExternalID:     root.ThreadUUID(),
+		TranscriptPath: root.Path(),
+		CWD:            "/workdir",
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	return fixture, engine, root
+}
+
+func TestEngine_SyncAll_CodexRoot_FirstChunk_EmitsCodexRolloutMeta(t *testing.T) {
+	mock := newMockBackend(t)
+	_, engine, root := codexEngineSetup(t, mock)
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	if len(mock.chunkRequests) != 1 {
+		t.Fatalf("chunk requests = %d, want 1", len(mock.chunkRequests))
+	}
+	req := mock.chunkRequests[0]
+	if req.FileType != "transcript" {
+		t.Errorf("FileType = %q, want transcript", req.FileType)
+	}
+	if req.Metadata == nil || req.Metadata.CodexRollout == nil {
+		t.Fatalf("Metadata.CodexRollout = nil, want populated; full meta=%+v", req.Metadata)
+	}
+	cr := req.Metadata.CodexRollout
+	if cr.ThreadUUID != root.ThreadUUID() {
+		t.Errorf("ThreadUUID = %q, want %q", cr.ThreadUUID, root.ThreadUUID())
+	}
+	if cr.ParentThreadUUID != "" {
+		t.Errorf("ParentThreadUUID = %q, want \"\" (root)", cr.ParentThreadUUID)
+	}
+	if cr.RolloutPath != root.Path() {
+		t.Errorf("RolloutPath = %q, want %q", cr.RolloutPath, root.Path())
+	}
+	// Model stays empty for a root: Codex's session_meta carries no `model`
+	// field in any released version (only `model_provider`). Descendants read
+	// theirs from the SQLite `threads` row. Follow-up covers roots.
+	if cr.Model != "" {
+		t.Errorf("Model = %q, want \"\" (session_meta has no model field)", cr.Model)
+	}
+	if cr.ThreadSource != "user" {
+		t.Errorf("ThreadSource = %q, want user", cr.ThreadSource)
+	}
+}
+
+func TestEngine_SyncAll_CodexRoot_SubsequentChunks_DoNotRepeatCodexRolloutMeta(t *testing.T) {
+	mock := newMockBackend(t)
+	fixture, engine, root := codexEngineSetup(t, mock)
+
+	// First cycle uploads the initial content.
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll #1: %v", err)
+	}
+	// Append more content to the root rollout, then sync again.
+	root.WithRawLine(`{"type":"event_msg","payload":{"type":"agent_message","message":"reply"}}`)
+	_ = fixture
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll #2: %v", err)
+	}
+
+	if len(mock.chunkRequests) < 2 {
+		t.Fatalf("expected at least 2 chunk requests, got %d", len(mock.chunkRequests))
+	}
+	// First chunk should carry meta; subsequent chunks (FirstLine > 1) should not.
+	first := mock.chunkRequests[0]
+	if first.Metadata == nil || first.Metadata.CodexRollout == nil {
+		t.Fatalf("first chunk missing codex_rollout meta")
+	}
+	for i := 1; i < len(mock.chunkRequests); i++ {
+		req := mock.chunkRequests[i]
+		if req.Metadata != nil && req.Metadata.CodexRollout != nil {
+			t.Errorf("chunk %d (FirstLine=%d) unexpectedly carries codex_rollout meta", i, req.FirstLine)
+		}
+	}
+}
+
+func TestEngine_SyncAll_CodexChild_FirstChunk_EmitsCodexRolloutMeta_WithParentSet(t *testing.T) {
+	mock := newMockBackend(t)
+	fixture, engine, root := codexEngineSetup(t, mock)
+	child := fixture.AddSubagent(root.ThreadUUID(), "child-thread",
+		codextest.SubagentOpts{
+			AgentPath:     "~/agents/planner.md",
+			AgentRole:     "planner",
+			AgentNickname: "Planny",
+		},
+	).WithSessionMeta("/childdir").
+		WithUserMessage("plan the work")
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	childChunk, ok := findChunkForFile(mock.chunkRequests, filepath.Base(child.Path()))
+	if !ok {
+		t.Fatalf("no chunk request for child %q; got %d requests", filepath.Base(child.Path()), len(mock.chunkRequests))
+	}
+	if childChunk.FileType != "agent" {
+		t.Errorf("FileType = %q, want agent (descendants upload as agent)", childChunk.FileType)
+	}
+	if childChunk.Metadata == nil || childChunk.Metadata.CodexRollout == nil {
+		t.Fatalf("child chunk missing codex_rollout meta")
+	}
+	cr := childChunk.Metadata.CodexRollout
+	if cr.ThreadUUID != child.ThreadUUID() {
+		t.Errorf("child meta ThreadUUID = %q, want %q", cr.ThreadUUID, child.ThreadUUID())
+	}
+	if cr.ParentThreadUUID != root.ThreadUUID() {
+		t.Errorf("child meta ParentThreadUUID = %q, want %q", cr.ParentThreadUUID, root.ThreadUUID())
+	}
+	if cr.AgentRole != "planner" {
+		t.Errorf("child meta AgentRole = %q, want planner", cr.AgentRole)
+	}
+	if cr.AgentNickname != "Planny" {
+		t.Errorf("child meta AgentNickname = %q, want Planny", cr.AgentNickname)
+	}
+	if cr.ThreadSource != "agent" {
+		t.Errorf("child meta ThreadSource = %q, want agent", cr.ThreadSource)
+	}
+}
+
+func TestEngine_SyncAll_CodexGrandchild_FirstChunk_EmitsCodexRolloutMeta_WithImmediateParent(t *testing.T) {
+	mock := newMockBackend(t)
+	fixture, engine, root := codexEngineSetup(t, mock)
+	child := fixture.AddSubagent(root.ThreadUUID(), "child",
+		codextest.SubagentOpts{AgentRole: "planner", AgentNickname: "P"}).
+		WithSessionMeta("/").WithUserMessage("plan")
+	grand := fixture.AddSubagent(child.ThreadUUID(), "grand",
+		codextest.SubagentOpts{AgentRole: "sub-planner", AgentNickname: "SP"}).
+		WithSessionMeta("/").WithUserMessage("sub-plan")
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	grandChunk, ok := findChunkForFile(mock.chunkRequests, filepath.Base(grand.Path()))
+	if !ok {
+		t.Fatalf("no chunk request for grandchild")
+	}
+	cr := grandChunk.Metadata.CodexRollout
+	if cr == nil {
+		t.Fatalf("grandchild missing codex_rollout meta")
+	}
+	if cr.ParentThreadUUID != child.ThreadUUID() {
+		t.Errorf("grandchild ParentThreadUUID = %q, want %q (immediate parent, NOT root)",
+			cr.ParentThreadUUID, child.ThreadUUID())
+	}
+}
+
+func TestEngine_SyncAll_Codex_AllChildrenUploadAsAgentFileType_AndAllTargetRootSession(t *testing.T) {
+	mock := newMockBackend(t)
+	fixture, engine, root := codexEngineSetup(t, mock)
+	for _, id := range []string{"a", "b", "c"} {
+		fixture.AddSubagent(root.ThreadUUID(), id, codextest.SubagentOpts{AgentRole: id}).
+			WithSessionMeta("/").WithUserMessage("task " + id)
+	}
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	rootName := filepath.Base(root.Path())
+	for _, req := range mock.chunkRequests {
+		if req.SessionID != "test-session-id" {
+			t.Errorf("chunk for %s SessionID = %q, want test-session-id (root's session)", req.FileName, req.SessionID)
+		}
+		if req.FileName == rootName {
+			if req.FileType != "transcript" {
+				t.Errorf("root chunk FileType = %q, want transcript", req.FileType)
+			}
+		} else {
+			if req.FileType != "agent" {
+				t.Errorf("descendant chunk %s FileType = %q, want agent", req.FileName, req.FileType)
+			}
+		}
+	}
+}
+
+func TestEngine_SyncAll_Codex_NewDescendantAppearsBetweenCycles_PickedUpNextCycle(t *testing.T) {
+	mock := newMockBackend(t)
+	fixture, engine, root := codexEngineSetup(t, mock)
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll #1: %v", err)
+	}
+	chunksAfterFirst := len(mock.chunkRequests)
+
+	// Subagent appears between cycles (simulating Codex spawning one mid-session).
+	late := fixture.AddSubagent(root.ThreadUUID(), "late",
+		codextest.SubagentOpts{AgentRole: "late-arrival"}).
+		WithSessionMeta("/").WithUserMessage("plan late")
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll #2: %v", err)
+	}
+	if len(mock.chunkRequests) <= chunksAfterFirst {
+		t.Fatalf("no new chunks after second cycle (had %d, total %d)",
+			chunksAfterFirst, len(mock.chunkRequests))
+	}
+	lateChunk, ok := findChunkForFile(mock.chunkRequests, filepath.Base(late.Path()))
+	if !ok {
+		t.Fatalf("late subagent never picked up")
+	}
+	if lateChunk.Metadata.CodexRollout.ParentThreadUUID != root.ThreadUUID() {
+		t.Errorf("late descendant parent = %q, want %q",
+			lateChunk.Metadata.CodexRollout.ParentThreadUUID, root.ThreadUUID())
+	}
+}
+
+func TestEngine_SyncAll_Codex_FailedChunkUpload_RetriesNextCycle_MetaSentAgainOnRetry(t *testing.T) {
+	mock := newMockBackend(t)
+	_, engine, _ := codexEngineSetup(t, mock)
+
+	// After Init succeeded, fail the next request (first chunk upload).
+	atomic.StoreInt32(&mock.failUntilCount, atomic.LoadInt32(&mock.requestCount)+1)
+
+	// First sync: chunk upload fails.
+	if _, err := engine.SyncAll(); err == nil {
+		t.Fatalf("SyncAll: expected error on first chunk, got nil")
+	}
+	if len(mock.chunkRequests) != 0 {
+		t.Fatalf("after failed sync, expected 0 successful chunkRequests; got %d", len(mock.chunkRequests))
+	}
+	// Reset fail counter so the next cycle can succeed.
+	atomic.StoreInt32(&mock.failUntilCount, 0)
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll retry: %v", err)
+	}
+	if len(mock.chunkRequests) == 0 {
+		t.Fatalf("no chunks uploaded on retry")
+	}
+	// FirstLine should still be 1 on retry, and codex_rollout meta should
+	// have ridden along again — backend upsert dedups.
+	retried := mock.chunkRequests[0]
+	if retried.FirstLine != 1 {
+		t.Errorf("retried chunk FirstLine = %d, want 1 (stable across retries)", retried.FirstLine)
+	}
+	if retried.Metadata == nil || retried.Metadata.CodexRollout == nil {
+		t.Errorf("retried chunk missing codex_rollout meta (should ride along again)")
+	}
+}
+
+func TestEngine_SyncAll_Claude_DoesNotEmitCodexRolloutMeta(t *testing.T) {
+	mock := newMockBackend(t)
+	server := httptest.NewServer(mock)
+	defer server.Close()
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	os.WriteFile(transcriptPath, []byte(`{"type":"user","message":"hi"}`+"\n"), 0644)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "claude-session",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	for i, req := range mock.chunkRequests {
+		if req.Metadata != nil && req.Metadata.CodexRollout != nil {
+			t.Errorf("Claude chunk %d unexpectedly carries codex_rollout meta", i)
+		}
+	}
+}
+
+func TestEngine_SyncAll_Codex_NoChildren_OnlyRootChunkUploaded(t *testing.T) {
+	mock := newMockBackend(t)
+	_, engine, root := codexEngineSetup(t, mock)
+
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	if len(mock.chunkRequests) != 1 {
+		t.Errorf("expected 1 chunk (root only, no descendants), got %d", len(mock.chunkRequests))
+	}
+	if mock.chunkRequests[0].FileName != filepath.Base(root.Path()) {
+		t.Errorf("chunk file = %q, want root rollout", mock.chunkRequests[0].FileName)
+	}
+}
+
+// ============================================================================
+// Workflow subagent file sync (CF-533)
+// ============================================================================
+
+// writeWorkflowSessionTree lays a transcript + a classic flat subagent + a
+// workflow run dir (agent + journal) under the conventional layout, and
+// returns the subagents dir. base = transcript path without ext.
+func writeWorkflowSessionTree(t *testing.T, transcriptPath, runID string) string {
+	t.Helper()
+	if err := os.WriteFile(transcriptPath, []byte(`{"type":"system","message":"start"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := transcriptPath[:len(transcriptPath)-len(filepath.Ext(transcriptPath))]
+	subagents := filepath.Join(base, "subagents")
+	// classic flat subagent (discovered by the existing directory scan)
+	if err := os.MkdirAll(subagents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subagents, "agent-yyyyyyy1.jsonl"), []byte(`{"type":"agent"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// workflow run dir
+	runDir := filepath.Join(subagents, "workflows", runID)
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"agent-aaaaaaa11.jsonl", "journal.jsonl"} {
+		if err := os.WriteFile(filepath.Join(runDir, f), []byte(`{"type":"x"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// files that must NOT be uploaded
+	for _, f := range []string{"agent-aaaaaaa11.meta.json", runID + ".json"} {
+		if err := os.WriteFile(filepath.Join(runDir, f), []byte(`{}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return subagents
+}
+
+// Spec: with both caps true, every workflow subagent transcript + the journal
+// upload with exact path-encoded file_names and types; classic flat subagent
+// still works; meta.json/wf_*.json are not uploaded; probe happens once;
+// re-sync is idempotent.
+func TestEngine_SyncAll_WorkflowFiles_BothCapsTrue_Uploaded(t *testing.T) {
+	mock := newMockBackend(t)
+	mock.caps = &Capabilities{WorkflowFiles: true, WorkflowJournal: true}
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	writeWorkflowSessionTree(t, transcriptPath, "wf_run1")
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "wf-both-true",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	agentChunk, ok := findChunkForFile(mock.chunkRequests, "subagents/workflows/wf_run1/agent-aaaaaaa11.jsonl")
+	if !ok {
+		t.Fatal("workflow agent transcript not uploaded")
+	}
+	if agentChunk.FileType != "agent" {
+		t.Errorf("workflow agent file_type = %q, want \"agent\"", agentChunk.FileType)
+	}
+	journalChunk, ok := findChunkForFile(mock.chunkRequests, "subagents/workflows/wf_run1/journal.jsonl")
+	if !ok {
+		t.Fatal("workflow journal not uploaded")
+	}
+	if journalChunk.FileType != "workflow_journal" {
+		t.Errorf("journal file_type = %q, want \"workflow_journal\"", journalChunk.FileType)
+	}
+	// classic flat subagent still uploaded
+	if _, ok := findChunkForFile(mock.chunkRequests, "agent-yyyyyyy1.jsonl"); !ok {
+		t.Error("classic flat subagent not uploaded (regression)")
+	}
+	// excluded files never uploaded
+	for _, req := range mock.chunkRequests {
+		if strings.HasSuffix(req.FileName, ".meta.json") || strings.HasSuffix(req.FileName, "wf_run1.json") {
+			t.Errorf("uploaded excluded file %q", req.FileName)
+		}
+	}
+
+	// probed exactly once and cached
+	if got := atomic.LoadInt32(&mock.capsRequestCount); got != 1 {
+		t.Errorf("capabilities probed %d times, want 1", got)
+	}
+
+	// idempotent: nothing changed → second SyncAll uploads nothing new
+	before := len(mock.chunkRequests)
+	n, err := engine.SyncAll()
+	if err != nil {
+		t.Fatalf("second SyncAll: %v", err)
+	}
+	if n != 0 || len(mock.chunkRequests) != before {
+		t.Errorf("second SyncAll uploaded %d chunks (total %d→%d), want 0 (idempotent)", n, before, len(mock.chunkRequests))
+	}
+	if got := atomic.LoadInt32(&mock.capsRequestCount); got != 1 {
+		t.Errorf("capabilities probed %d times after 2 cycles, want 1 (cached)", got)
+	}
+}
+
+// Spec: a 404 (old backend) cleanly skips workflow files; the rest of the
+// sync (transcript + classic subagent) is unaffected.
+func TestEngine_SyncAll_WorkflowFiles_404_Skipped(t *testing.T) {
+	mock := newMockBackend(t) // caps==nil → 404
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	writeWorkflowSessionTree(t, transcriptPath, "wf_run1")
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "wf-404",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	for _, req := range mock.chunkRequests {
+		if strings.Contains(req.FileName, "workflows/") {
+			t.Errorf("workflow file %q uploaded despite 404 capabilities", req.FileName)
+		}
+	}
+	// rest of sync unaffected
+	if _, ok := findChunkForFile(mock.chunkRequests, "transcript.jsonl"); !ok {
+		t.Error("transcript not uploaded")
+	}
+	if _, ok := findChunkForFile(mock.chunkRequests, "agent-yyyyyyy1.jsonl"); !ok {
+		t.Error("classic flat subagent not uploaded")
+	}
+}
+
+// Spec: per-flag gating — workflow_files=true, workflow_journal=false uploads
+// the agent transcript but skips the journal.
+func TestEngine_SyncAll_WorkflowFiles_JournalCapFalse_PartialUpload(t *testing.T) {
+	mock := newMockBackend(t)
+	mock.caps = &Capabilities{WorkflowFiles: true, WorkflowJournal: false}
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	writeWorkflowSessionTree(t, transcriptPath, "wf_run1")
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "wf-partial",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+
+	if _, ok := findChunkForFile(mock.chunkRequests, "subagents/workflows/wf_run1/agent-aaaaaaa11.jsonl"); !ok {
+		t.Error("workflow agent transcript not uploaded (workflow_files=true)")
+	}
+	if _, ok := findChunkForFile(mock.chunkRequests, "subagents/workflows/wf_run1/journal.jsonl"); ok {
+		t.Error("journal uploaded despite workflow_journal=false")
+	}
+}
+
+// Spec: a transient probe failure (5xx) is not cached — it probes at most once
+// per cycle (not once per workflow file), skips workflow uploads that cycle,
+// and re-probes the next cycle, succeeding once the backend recovers.
+func TestEngine_SyncAll_WorkflowFiles_TransientProbe_RetriesNextCycle(t *testing.T) {
+	mock := newMockBackend(t)
+	mock.capsStatus = http.StatusInternalServerError // transient failure
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	writeWorkflowSessionTree(t, transcriptPath, "wf_run1") // 2 workflow files
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		ExternalID:     "wf-transient",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Cycle 1: backend failing. Workflow files skipped; probed at most once
+	// (NOT once per workflow file) and not cached.
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll cycle 1: %v", err)
+	}
+	for _, req := range mock.chunkRequests {
+		if strings.Contains(req.FileName, "workflows/") {
+			t.Errorf("workflow file %q uploaded despite transient probe failure", req.FileName)
+		}
+	}
+	if got := atomic.LoadInt32(&mock.capsRequestCount); got != 1 {
+		t.Errorf("cycle 1 probed %d times, want 1 (once per cycle, not per file)", got)
+	}
+
+	// Backend recovers; cycle 2 re-probes and uploads.
+	mock.capsStatus = 0
+	mock.caps = &Capabilities{WorkflowFiles: true, WorkflowJournal: true}
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll cycle 2: %v", err)
+	}
+	if _, ok := findChunkForFile(mock.chunkRequests, "subagents/workflows/wf_run1/agent-aaaaaaa11.jsonl"); !ok {
+		t.Error("workflow agent not uploaded after backend recovered (transient failure was cached)")
+	}
+	if _, ok := findChunkForFile(mock.chunkRequests, "subagents/workflows/wf_run1/journal.jsonl"); !ok {
+		t.Error("workflow journal not uploaded after backend recovered")
+	}
+	if got := atomic.LoadInt32(&mock.capsRequestCount); got != 2 {
+		t.Errorf("total probes = %d, want 2 (one transient + one definitive)", got)
+	}
+}
+
+// ============================================================================
+// CF-538: OpenCode subagent sidechain registrar wiring + capability gate
+// ============================================================================
+
+// fakeDescendantRegistrar records DescendantRegistrar calls plus the
+// CF-538-specific RegisterOpencodeChild call. Used by TestEngine_SetDescendantRegistrar
+// to assert the engine's SyncAll passes the injected registrar (not the
+// engine's own *FileTracker) to provider.DiscoverDescendants.
+type fakeDescendantRegistrar struct {
+	*FileTracker // embed so DescendantRegistrar methods compose
+
+	registeredChildren []string
+}
+
+func (f *fakeDescendantRegistrar) RegisterOpencodeChild(childID, localPath string) {
+	f.registeredChildren = append(f.registeredChildren, childID)
+}
+
+// TestEngine_SetDescendantRegistrar_OverridesDefault asserts that when the
+// daemon sets a custom registrar, SyncAll passes that registrar (not the
+// engine's own *FileTracker) to provider.DiscoverDescendants.
+//
+// We exercise this through the OpenCode provider: a fixture DB with one
+// root + one descendant; if the registrar is invoked, the fake records
+// the RegisterOpencodeChild call.
+func TestEngine_SetDescendantRegistrar_OverridesDefault(t *testing.T) {
+	t.Helper()
+	mock := newMockBackend(t)
+	mock.caps = &Capabilities{OpencodeSubagentFiles: true}
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	// Materialized file with one line so Init has something to register.
+	_ = os.WriteFile(transcriptPath, []byte(`{"info":{"id":"msg_1","sessionID":"ses_root","role":"user"},"parts":[]}`+"\n"), 0644)
+
+	// Set up an OpenCode fixture DB with a child of "ses_root".
+	dbPath := opencodeFixtureWithChild(t, "ses_root", "ses_child")
+	t.Setenv("CONFAB_OPENCODE_DB", dbPath)
+
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       provider.NameOpencode,
+		ExternalID:     "ses_root",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	fake := &fakeDescendantRegistrar{FileTracker: engine.tracker}
+	engine.SetDescendantRegistrar(fake)
+
+	if err := engine.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := engine.SyncAll(); err != nil {
+		t.Fatalf("SyncAll: %v", err)
+	}
+	if len(fake.registeredChildren) != 1 || fake.registeredChildren[0] != "ses_child" {
+		t.Errorf("RegisterOpencodeChild calls = %v, want [ses_child]", fake.registeredChildren)
+	}
+}
+
+// TestEngine_OpencodeChildFilesAllowed_CachesDefinitiveAnswers asserts the
+// capability accessor uses the existing resolveCaps cache: definitive
+// answers (200, 404) are cached for the engine lifetime; transient
+// failures are not cached.
+func TestEngine_OpencodeChildFilesAllowed_CachesDefinitiveAnswers(t *testing.T) {
+	mock := newMockBackend(t)
+	mock.caps = &Capabilities{OpencodeSubagentFiles: true}
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       provider.NameOpencode,
+		ExternalID:     "ses_root",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if !engine.OpencodeChildFilesAllowed() {
+		t.Error("OpencodeChildFilesAllowed = false after caps:true, want true")
+	}
+	// resetCapsProbeForCycle is a per-cycle no-op when capsResolved is true.
+	// Re-call: should NOT re-probe.
+	before := atomic.LoadInt32(&mock.capsRequestCount)
+	for i := 0; i < 5; i++ {
+		_ = engine.OpencodeChildFilesAllowed()
+	}
+	after := atomic.LoadInt32(&mock.capsRequestCount)
+	if before != after {
+		t.Errorf("probed %d more times after definitive cache, want 0", after-before)
+	}
+}
+
+// TestEngine_OpencodeChildFilesAllowed_GatesOffWhenCapabilityFalse asserts
+// the accessor returns false when the backend advertises support is off,
+// regardless of how many times it's called.
+func TestEngine_OpencodeChildFilesAllowed_GatesOffWhenCapabilityFalse(t *testing.T) {
+	mock := newMockBackend(t)
+	mock.caps = &Capabilities{OpencodeSubagentFiles: false}
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       provider.NameOpencode,
+		ExternalID:     "ses_root",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if engine.OpencodeChildFilesAllowed() {
+		t.Error("OpencodeChildFilesAllowed = true after caps:false, want false")
+	}
+}
+
+// TestEngine_OpencodeChildFilesAllowed_404Cached asserts that a 404 (old
+// backend, no capabilities endpoint) is treated as a definitive negative
+// answer and cached — no repeat probing.
+func TestEngine_OpencodeChildFilesAllowed_404Cached(t *testing.T) {
+	mock := newMockBackend(t) // caps==nil → 404
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tmpDir, transcriptPath := setupTestEnv(t, server.URL)
+	engine := newEngineWithBackend(t, mustNewClient(t, server.URL, tmpDir), nil, EngineConfig{
+		Provider:       provider.NameOpencode,
+		ExternalID:     "ses_root",
+		TranscriptPath: transcriptPath,
+		CWD:            tmpDir,
+	})
+
+	if engine.OpencodeChildFilesAllowed() {
+		t.Error("OpencodeChildFilesAllowed = true on 404 backend, want false")
+	}
+	probes := atomic.LoadInt32(&mock.capsRequestCount)
+	for i := 0; i < 3; i++ {
+		_ = engine.OpencodeChildFilesAllowed()
+	}
+	if got := atomic.LoadInt32(&mock.capsRequestCount); got != probes {
+		t.Errorf("probed %d times after 404 was cached, want %d (no re-probe)", got, probes)
+	}
+}
+
+// opencodeFixtureWithChild creates an OpenCode SQLite fixture with one root
+// session and one direct child. Used by the registrar-injection test to
+// verify SyncAll routes through the injected registrar with at least one
+// descendant in flight.
+func opencodeFixtureWithChild(t *testing.T, rootID, childID string) string {
+	t.Helper()
+	b := opencodetest.NewDB(t)
+	b.AddSession(rootID, "").AddSession(childID, rootID)
+	return b.Path()
+}

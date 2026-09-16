@@ -1,0 +1,27 @@
+{
+  "name": "universal-onboarding-s1-first-connection",
+  "title": "S1 首次接入与授权闭环",
+  "status": "pending",
+  "task_type": "AFK",
+  "dependencies": [
+    "universal-onboarding-s0-compatibility"
+  ],
+  "goal": "干净环境添加插件后，通过预置后端、首次网页授权和共享核心完成一条虚构会话同步。",
+  "requirement": "docs/prd/universal-onboarding.md",
+  "design": "docs/design/universal-onboarding.md",
+  "prd": ".trellis/tasks/universal-onboarding-s1-first-connection/prd.md",
+  "scope": [
+    "packages/opencode-plugin/",
+    "cmd/integration*.go",
+    "cmd/login.go",
+    "pkg/onboarding/",
+    "pkg/config/",
+    "pkg/confabpath/",
+    "test/portable/"
+  ],
+  "approval": {
+    "date": "2026-09-16",
+    "basis": "用户确认开发设计方案及推荐实施路线；环境地址、分发条件和实际版本仍按设计待落实。"
+  },
+  "verification_status": "not_run"
+}

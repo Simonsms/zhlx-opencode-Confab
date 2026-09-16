@@ -1,0 +1,21 @@
+{
+  "name": "universal-onboarding-s0-compatibility",
+  "title": "S0 原版 OpenCode 兼容性与最小接入探针",
+  "status": "pending",
+  "task_type": "AFK",
+  "dependencies": [],
+  "goal": "在隔离环境中证明原版 OpenCode 能加载独立插件，并无窗口调用随包 Confab；冻结实际宿主、SDK 和运行时版本。",
+  "requirement": "docs/prd/universal-onboarding.md",
+  "design": "docs/design/universal-onboarding.md",
+  "prd": ".trellis/tasks/universal-onboarding-s0-compatibility/prd.md",
+  "scope": [
+    "packages/opencode-plugin/",
+    "test/portable/",
+    "docs/handoff/universal-onboarding/"
+  ],
+  "approval": {
+    "date": "2026-09-16",
+    "basis": "用户确认开发设计方案及推荐实施路线；环境地址、分发条件和实际版本仍按设计待落实。"
+  },
+  "verification_status": "not_run"
+}

@@ -1,0 +1,43 @@
+# Releasing Confab
+
+This fork publishes to `Simonsms/zhlx-opencode-Confab`. The installer and
+CLI update endpoint target the same repository. Preserve upstream attribution
+and license; do not push this fork's tags or commits to `upstream`.
+
+Repository initialization does not create a release. Windows ZIP builds
+currently use `scripts/build-windows-portable.ps1`; automated Windows release
+artifacts and the managed-plugin release flow remain separate planned work.
+
+## Steps
+
+1. **Pull latest main**
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+2. **Tag and push**
+   ```bash
+   git tag v0.X.Y
+   git push origin v0.X.Y
+   ```
+
+3. **GoReleaser handles the rest** — a GitHub Actions workflow runs GoReleaser on tag push, which builds cross-platform binaries and creates the GitHub release with these `.tar.gz` archives (named `confab_<version>_<os>_<arch>.tar.gz`):
+   - `confab_<version>_darwin_amd64.tar.gz` - macOS Intel
+   - `confab_<version>_darwin_arm64.tar.gz` - macOS Apple Silicon
+   - `confab_<version>_linux_amd64.tar.gz` - Linux x86_64
+   - `confab_<version>_linux_arm64.tar.gz` - Linux ARM64
+
+   The CLI auto-update mechanism fetches the latest release from GitHub.
+
+## Version Format
+
+- Use semver with `v` prefix: `v0.3.1`
+- The CLI compares versions numerically (major.minor.patch)
+
+## Auto-Update Behavior
+
+- `confab update` checks GitHub releases API for the latest version
+- The SessionStart hook auto-updates and re-execs if a new version is available
+- User-facing commands (`list`, `save`, `status`) show an update notice but don't auto-install
+- Checks are rate-limited to once per hour per machine

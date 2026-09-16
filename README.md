@@ -1,0 +1,223 @@
+# confab
+
+本仓库是基于 [ConfabulousDev/confab](https://github.com/ConfabulousDev/confab) 的派生开发仓库，保留上游来源和 MIT 许可。新仓库从清理后的源码快照开始独立历史；原始历史保留在上游和本地归档中，详见版本管理约定。
+
+当前包含 Windows/OpenCode 便携运行与后台进程修复，通用低配置接入插件尚处于已确认设计、待实现阶段：
+
+- [Windows 便携版使用与构建](docs/windows-portable.md)
+- [已确认开发设计](docs/design/universal-onboarding.md)
+- [开发进度与新窗口接手](docs/handoff/universal-onboarding/progress.md)
+- [版本管理约定](docs/version-control.md)
+
+当前尚未发布此派生仓库的 Release。请先按便携版文档从源码构建；下方 Linux/macOS 安装脚本需要本仓库发布对应 Release 后才能使用。
+
+Sync and explore Claude Code, Codex, OpenCode, and Cursor sessions. Connect `confab` to your Confab backend to capture transcripts in real time for exploration, sharing, and analysis.
+
+Your `claude`, `codex`, `opencode`, and `cursor` workflows stay unchanged.
+
+![How Confab works](docs/how-it-works.svg)
+
+## Install
+
+Supported on macOS and Linux (and native Windows — see [Windows support](docs/windows.md)).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Simonsms/zhlx-opencode-Confab/main/install.sh | bash
+# Follow the instructions to add confab to your PATH
+confab setup --backend-url https://confab.yourcompany.com
+```
+
+On Windows, build `confab.exe` and follow [the portable guide](docs/windows-portable.md).
+OpenCode sync uses an absolute executable binding and does not require PATH.
+
+`confab setup` detects providers (`claude`, `codex`, `opencode`, `cursor-agent` on `PATH`, or a present state dir such as `~/.cursor`) and wires each one. Claude Code, Codex, OpenCode, and Cursor sessions sync in the same setup pass.
+
+## Connect to Your Backend
+
+```bash
+# Initial setup: backend, auth, hooks, bundled skills
+confab setup --backend-url https://confab.yourcompany.com
+
+# Login separately (if already set up)
+confab login --backend-url https://confab.yourcompany.com
+
+# Check connection and hook status
+confab status
+
+# Logout
+confab logout
+```
+
+## Self-Hosting the Backend
+
+To deploy your own Confab backend, see [confab-web](https://github.com/ConfabulousDev/confab-web).
+
+## Usage
+
+### Sync Mode (Default)
+
+Sessions are synced incrementally while you work:
+
+```bash
+# Install sync hooks (done automatically by setup)
+confab hooks add
+
+# View running sync daemons
+confab sync status
+
+# Remove hooks
+confab hooks remove
+```
+
+The sync daemon uploads transcript chunks while you work, reducing data loss if the session exits unexpectedly.
+
+### List Sessions
+
+```bash
+# List all local sessions
+confab list
+
+# Filter by duration
+confab list -d 5d    # Sessions from last 5 days
+confab list -d 12h   # Sessions from last 12 hours
+```
+
+Use a listed session ID with `confab save`.
+
+### Manual Upload
+
+```bash
+# Upload specific sessions by ID (use IDs from 'confab list')
+confab save abc123de
+
+# Upload multiple sessions
+confab save abc123de f9e8d7c6
+```
+
+### Redaction
+
+Sensitive data is automatically redacted before uploading. Redaction is enabled by default during `confab setup`.
+
+Built-in patterns detect common secrets (API keys, private keys, JWT tokens, database passwords, and more) without any configuration.
+
+See [Redaction](REDACTION.md) for configuration details.
+
+## Codex
+
+Confab supports Codex alongside Claude Code. `confab setup` detects `codex` on `PATH` and wires Codex hooks automatically. Use `--provider codex` to configure only Codex.
+
+```bash
+# Auto-detect: installs hooks for every provider CLI on PATH
+confab setup --backend-url https://confab.yourcompany.com
+
+# Codex-only (explicit override)
+confab setup --provider codex --backend-url https://confab.yourcompany.com
+
+# List Codex sessions
+confab list --provider codex
+
+# Upload a specific Codex session
+confab save --provider codex <id>
+```
+
+Codex stores rollouts under `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`. Confab uses Codex's local SQLite state to walk subagent trees and sync descendant rollouts as sidechain files under the root session.
+
+### Caveats
+
+- Bundled skills (`/retro`) install for Claude Code, Codex, and OpenCode.
+- GitHub commit/PR linking is wired for Claude Code and Codex. Claude also supports the GitHub MCP PR matcher; Codex uses Bash hooks.
+- Codex sync daemons shut down via parent-process liveness, not a `SessionEnd`/`Stop` hook.
+
+## OpenCode
+
+Confab supports OpenCode alongside Claude Code and Codex. `confab setup` detects `opencode` on `PATH` and wires it automatically. Use `--provider opencode` to configure only OpenCode.
+
+```bash
+# Auto-detect: wires every provider CLI on PATH
+confab setup --backend-url https://confab.yourcompany.com
+
+# OpenCode-only (explicit override)
+confab setup --provider opencode --backend-url https://confab.yourcompany.com
+```
+
+OpenCode has no on-disk transcript file — session data lives in a local SQLite database (`~/.local/share/opencode/opencode.db`). Confab does not edit OpenCode's config; instead `setup` installs a small TypeScript plugin into `~/.config/opencode/plugins/` that starts and stops the sync daemon on session lifecycle events. The daemon reads the SQLite database, materializes each session into a local transcript file, and uploads it through the same incremental, redacted pipeline as the other providers. OpenCode resolves its dirs via `xdg-basedir` on every platform, so on native Windows the paths are `C:\Users\<you>\.config\opencode\plugins\` and `C:\Users\<you>\.local\share\opencode\opencode.db` (OpenCode never uses `%APPDATA%`).
+
+### Caveats
+
+- **Live sync only.** OpenCode sessions are captured while you work. Offline commands (`confab list --provider opencode`, `confab save --provider opencode`) are not supported.
+- **No GitHub commit/PR linking.** The bidirectional GitHub linking wired for Claude Code and Codex is not available for OpenCode.
+- **Root sessions only.** OpenCode subagent sessions are suppressed; only the user-initiated root session is captured.
+- **Plugin-based install.** Lifecycle is driven by the installed plugin (not an OpenCode-native hook system). The daemon also monitors the parent OpenCode process and exits if it dies.
+- Bundled skills (`/retro`) install under `~/.config/opencode/skills/`.
+
+## Cursor
+
+Confab supports Cursor — both the `cursor-agent` CLI and the Cursor desktop IDE. `confab setup` detects Cursor when `cursor-agent` is on `PATH` **or** the `~/.cursor` state dir is present (so IDE-only users are detected too) and wires it automatically. Use `--provider cursor` to configure only Cursor.
+
+```bash
+# Auto-detect: wires every detected provider
+confab setup --backend-url https://confab.yourcompany.com
+
+# Cursor-only (explicit override)
+confab setup --provider cursor --backend-url https://confab.yourcompany.com
+```
+
+Cursor writes per-session transcripts to disk at `~/.cursor/projects/<workspace>/agent-transcripts/<id>/<id>.jsonl`. `confab setup` installs `sessionStart` + `sessionEnd` hooks into `~/.cursor/hooks.json` (merging into any user-authored hooks). Subagent transcripts live beside the root under `subagents/<id>.jsonl` and sync as `file_type=agent` sidechain files under the root session, through the same incremental, redacted pipeline as the other providers.
+
+### Caveats
+
+- **No tool results.** Cursor's transcript records prompts, assistant text, and tool *calls* but not tool *results*, so synced Cursor sessions show no tool outputs.
+- **Hybrid shutdown.** The CLI fires `sessionEnd` reliably, but the IDE only fires it on window/app close (not per chat-tab). The daemon's parent-PID liveness on the shared `Cursor.app` process is the primary IDE shutdown — a long IDE session with several chats keeps per-session daemons alive (still syncing incrementally) until the window closes.
+- **No GitHub commit/PR linking.** The bidirectional GitHub linking wired for Claude Code and Codex is not available for Cursor.
+- Bundled skills (`/retro`) install under `~/.cursor/skills/`.
+
+## Configuration
+
+| File | Purpose |
+|------|---------|
+| `~/.confab/config.json` | Backend URL, API key, and redaction settings |
+| `~/.confab/logs/confab.log` | Operation logs (auto-rotated, 14 day retention) |
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CONFAB_CLAUDE_DIR` | `~/.claude` | Override the Claude Code state directory |
+| `CONFAB_CODEX_DIR` | `~/.codex` | Override the Codex state directory |
+| `CONFAB_OPENCODE_CONFIG_DIR` | `~/.config/opencode` | Override the OpenCode config directory (plugin + skills) |
+| `CONFAB_OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Override the OpenCode SQLite database location |
+| `CONFAB_CURSOR_DIR` | `~/.cursor` | Override the Cursor state directory (hooks + skills + transcripts) |
+| `CONFAB_CONFIG_PATH` | `~/.confab/config.json` | Config file location |
+| `CONFAB_LOG_DIR` | `~/.confab/logs` | Log directory |
+
+## Developer Docs
+
+Each package has a README with extension guides, invariants, and design decisions:
+
+- [`cmd/`](cmd/README.md) — CLI commands and hook handlers
+- [`pkg/`](pkg/README.md) — Package index and dependency map
+  - [`config`](pkg/config/README.md), [`daemon`](pkg/daemon/README.md), [`git`](pkg/git/README.md), [`hookconfig`](pkg/hookconfig/README.md), [`http`](pkg/http/README.md), [`logger`](pkg/logger/README.md), [`provider`](pkg/provider/README.md), [`redactor`](pkg/redactor/README.md), [`sync`](pkg/sync/README.md), [`types`](pkg/types/README.md), [`utils`](pkg/utils/README.md)
+
+See also [`CLAUDE.md`](CLAUDE.md) for AI-oriented architecture notes and development practices.
+
+## Development
+
+```bash
+make build
+go test ./...
+```
+
+### Building from Source
+
+```bash
+git clone https://github.com/ConfabulousDev/confab.git
+cd confab
+make build
+./confab install
+# Follow the instructions to add confab to your PATH
+confab setup --backend-url https://confab.yourcompany.com
+```
+
+## License
+
+MIT

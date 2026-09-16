@@ -1,0 +1,25 @@
+{
+  "name": "universal-onboarding-s4-external-acceptance",
+  "title": "S4 外网发行与真实端到端验收",
+  "status": "pending",
+  "task_type": "HITL",
+  "dependencies": [
+    "universal-onboarding-s3-managed-upgrades"
+  ],
+  "goal": "从指定的外网测试源安装真实发行包，使用真实测试后端验证首次接入和虚构会话同步。",
+  "requirement": "docs/prd/universal-onboarding.md",
+  "design": "docs/design/universal-onboarding.md",
+  "prd": ".trellis/tasks/universal-onboarding-s4-external-acceptance/prd.md",
+  "scope": [
+    "packages/opencode-plugin/",
+    ".goreleaser.yaml",
+    ".github/workflows/",
+    "scripts/",
+    "docs/handoff/universal-onboarding/"
+  ],
+  "approval": {
+    "date": "2026-09-16",
+    "basis": "用户确认开发设计方案及推荐实施路线；环境地址、分发条件和实际版本仍按设计待落实。"
+  },
+  "verification_status": "not_run"
+}

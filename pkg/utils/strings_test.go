@@ -1,0 +1,166 @@
+package utils
+
+import "testing"
+
+func TestTruncateSecret(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		prefixLen int
+		suffixLen int
+		want      string
+	}{
+		{
+			name:      "normal API key",
+			input:     "fixture_abcdefghijklmnopqrstuvwxyz123456",
+			prefixLen: 8,
+			suffixLen: 4,
+			want:      "fixture_...3456",
+		},
+		{
+			name:      "longer prefix for status display",
+			input:     "fixture_abcdefghijklmnopqrstuvwxyz123456",
+			prefixLen: 12,
+			suffixLen: 4,
+			want:      "fixture_abcd...3456",
+		},
+		{
+			name:      "exactly minimum length",
+			input:     "abcdefghijkl",
+			prefixLen: 8,
+			suffixLen: 4,
+			want:      "abcdefgh...ijkl",
+		},
+		{
+			name:      "too short - masks",
+			input:     "short",
+			prefixLen: 8,
+			suffixLen: 4,
+			want:      "***",
+		},
+		{
+			name:      "empty string",
+			input:     "",
+			prefixLen: 8,
+			suffixLen: 4,
+			want:      "(empty)",
+		},
+		{
+			name:      "one character",
+			input:     "x",
+			prefixLen: 8,
+			suffixLen: 4,
+			want:      "***",
+		},
+		{
+			name:      "just under minimum",
+			input:     "abcdefghijk", // 11 chars, need 12
+			prefixLen: 8,
+			suffixLen: 4,
+			want:      "***",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := TruncateSecret(tt.input, tt.prefixLen, tt.suffixLen)
+			if got != tt.want {
+				t.Errorf("TruncateSecret(%q, %d, %d) = %q, want %q",
+					tt.input, tt.prefixLen, tt.suffixLen, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTruncateSecretNoPanic ensures no panic on edge cases
+func TestTruncateSecretNoPanic(t *testing.T) {
+	// These should never panic
+	inputs := []string{"", "a", "ab", "abc", "abcd", "abcde", "abcdefghijklmnop"}
+	for _, input := range inputs {
+		// Should not panic regardless of prefix/suffix lengths,
+		// including negative lengths (which would otherwise produce
+		// out-of-range slice indices).
+		_ = TruncateSecret(input, 0, 0)
+		_ = TruncateSecret(input, 1, 1)
+		_ = TruncateSecret(input, 8, 4)
+		_ = TruncateSecret(input, 12, 4)
+		_ = TruncateSecret(input, 100, 100)
+		_ = TruncateSecret(input, -1, 4)
+		_ = TruncateSecret(input, 4, -1)
+		_ = TruncateSecret(input, -5, -5)
+	}
+}
+
+// TestTruncateSecretNegativeLengths pins the masked fallback for invalid
+// (negative) lengths so callers never trigger a slice-bounds panic.
+func TestTruncateSecretNegativeLengths(t *testing.T) {
+	cases := []struct {
+		name      string
+		input     string
+		prefixLen int
+		suffixLen int
+		want      string
+	}{
+		{name: "negative suffix on long string", input: "abcdefghijklmnop", prefixLen: 4, suffixLen: -1, want: "***"},
+		{name: "negative prefix on long string", input: "abcdefghijklmnop", prefixLen: -1, suffixLen: 4, want: "***"},
+		{name: "both negative", input: "abcdefghijklmnop", prefixLen: -5, suffixLen: -5, want: "***"},
+		{name: "negative on empty", input: "", prefixLen: -1, suffixLen: -1, want: "(empty)"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := TruncateSecret(tt.input, tt.prefixLen, tt.suffixLen); got != tt.want {
+				t.Errorf("TruncateSecret(%q, %d, %d) = %q, want %q",
+					tt.input, tt.prefixLen, tt.suffixLen, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTruncateEnd(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "short string unchanged",
+			input:    "Fix bug",
+			maxLen:   50,
+			expected: "Fix bug",
+		},
+		{
+			name:     "long string truncated with ellipsis",
+			input:    "This is a very long title that exceeds the maximum length",
+			maxLen:   30,
+			expected: "This is a very long title t...",
+		},
+		{
+			name:     "exact length unchanged",
+			input:    "Exactly thirty characters!!!!",
+			maxLen:   29,
+			expected: "Exactly thirty characters!!!!",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			maxLen:   30,
+			expected: "",
+		},
+		{
+			name:     "very small maxLen uses minimum of 4",
+			input:    "Hello world",
+			maxLen:   2,
+			expected: "H...",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := TruncateEnd(tt.input, tt.maxLen)
+			if result != tt.expected {
+				t.Errorf("TruncateEnd(%q, %d) = %q, want %q", tt.input, tt.maxLen, result, tt.expected)
+			}
+		})
+	}
+}

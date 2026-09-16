@@ -1,0 +1,467 @@
+package cmd
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/ConfabulousDev/confab/pkg/confabpath"
+	"github.com/ConfabulousDev/confab/pkg/config"
+	"github.com/ConfabulousDev/confab/pkg/logger"
+	"github.com/spf13/cobra"
+)
+
+const (
+	// GitHub repository for releases
+	githubRepo = "Simonsms/zhlx-opencode-Confab"
+
+	// GitHub API URL for latest release
+	githubReleasesAPI = "https://api.github.com/repos/" + githubRepo + "/releases/latest"
+)
+
+var checkOnly bool
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Update confab to the latest version",
+	Long: `Checks for a newer version of confab and installs it if available.
+
+Use --check to only check for updates without installing.`,
+	RunE: runUpdate,
+}
+
+func runUpdate(cmd *cobra.Command, args []string) error {
+	logger.Info("Running update command (check=%v)", checkOnly)
+
+	result, err := checkForUpdate()
+	if err != nil {
+		logger.Error("Failed to fetch latest version: %v", err)
+		return fmt.Errorf("failed to check for updates: %w", err)
+	}
+
+	logger.Info("Current version: %s, Latest version: %s", version, result.latest)
+
+	if !result.needsUpdate {
+		fmt.Printf("confab is up to date (v%s)\n", result.cleanLatest)
+		return nil
+	}
+
+	// Show version info
+	fmt.Printf("Current version: %s\n", version)
+	fmt.Printf("Latest version:  %s\n", result.latest)
+	fmt.Println()
+
+	if checkOnly {
+		fmt.Println("Update available! Run 'confab update' to install.")
+		return nil
+	}
+
+	// Perform update
+	fmt.Println("Updating confab...")
+	fmt.Println()
+
+	if _, err := installLatestRelease(); err != nil {
+		logger.Error("Failed to install update: %v", err)
+		return fmt.Errorf("update failed: %w", err)
+	}
+
+	logger.Info("Update complete")
+	return nil
+}
+
+// githubRelease represents the relevant fields from GitHub's release API
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+// fetchLatestRelease fetches the latest release info from GitHub
+func fetchLatestRelease() (*githubRelease, error) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", githubReleasesAPI, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+	}
+
+	var release githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return nil, fmt.Errorf("failed to parse GitHub response: %w", err)
+	}
+
+	return &release, nil
+}
+
+// fetchLatestVersion fetches the latest version string from GitHub releases
+func fetchLatestVersion() (string, error) {
+	release, err := fetchLatestRelease()
+	if err != nil {
+		return "", err
+	}
+	return release.TagName, nil
+}
+
+// cleanVersion strips the "v" prefix from a version string.
+func cleanVersion(v string) string {
+	return strings.TrimPrefix(v, "v")
+}
+
+// updateCheckResult is the outcome of comparing the running version against
+// the latest GitHub release.
+type updateCheckResult struct {
+	latest      string // raw latest version string, e.g. "v1.2.3"
+	cleanLatest string // latest with any "v" prefix stripped
+	needsUpdate bool
+}
+
+// checkForUpdate fetches the latest release version and reports whether it's
+// newer than the running binary.
+func checkForUpdate() (updateCheckResult, error) {
+	latest, err := fetchLatestVersion()
+	if err != nil {
+		return updateCheckResult{}, err
+	}
+	cleanLatest := cleanVersion(latest)
+	return updateCheckResult{
+		latest:      latest,
+		cleanLatest: cleanLatest,
+		needsUpdate: isNewerVersion(cleanVersion(version), cleanLatest),
+	}, nil
+}
+
+// isNewerVersion returns true if latest is newer than current
+func isNewerVersion(current, latest string) bool {
+	// Dev builds always need update
+	if current == "dev" || current == "none" || current == "" {
+		return true
+	}
+
+	currentParts := parseVersion(current)
+	latestParts := parseVersion(latest)
+
+	for i := range 3 {
+		if latestParts[i] > currentParts[i] {
+			return true
+		}
+		if latestParts[i] < currentParts[i] {
+			return false
+		}
+	}
+
+	return false
+}
+
+// parseVersion parses a version string into [major, minor, patch]
+func parseVersion(v string) [3]int {
+	var parts [3]int
+	segments := strings.Split(v, ".")
+
+	for i := 0; i < len(segments) && i < 3; i++ {
+		// Strip any suffix (e.g., "1.0.0-beta" -> "1.0.0")
+		numStr, _, _ := strings.Cut(segments[i], "-")
+		num, _ := strconv.Atoi(numStr)
+		parts[i] = num
+	}
+
+	return parts
+}
+
+// findAssetURL finds the download URL for the current platform from a release.
+// GoReleaser produces assets named confab_<version>_<os>_<arch>.tar.gz,
+// so we match by the _<os>_<arch>.tar.gz suffix.
+func findAssetURL(release *githubRelease) (string, error) {
+	return findAssetURLForPlatform(release, runtime.GOOS, runtime.GOARCH)
+}
+
+// findAssetURLForPlatform finds the download URL for the given OS/arch from a release.
+func findAssetURLForPlatform(release *githubRelease, goos, goarch string) (string, error) {
+	suffix := fmt.Sprintf("_%s_%s.tar.gz", goos, goarch)
+
+	for _, asset := range release.Assets {
+		if strings.HasSuffix(asset.Name, suffix) {
+			return asset.BrowserDownloadURL, nil
+		}
+	}
+
+	return "", fmt.Errorf("no asset found for %s/%s", goos, goarch)
+}
+
+// downloadAndExtract downloads a .tar.gz asset from the given URL,
+// extracts the "confab" binary from it, and writes it to destPath atomically.
+func downloadAndExtract(url, destPath string) error {
+	client := &http.Client{
+		Timeout: 120 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download archive: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status %d", resp.StatusCode)
+	}
+
+	return extractConfabBinary(resp.Body, destPath)
+}
+
+// extractConfabBinary reads a gzipped tar archive from r, finds the "confab"
+// binary entry, and writes it to destPath atomically via a temp file.
+func extractConfabBinary(r io.Reader, destPath string) error {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("failed to decompress archive: %w", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read archive: %w", err)
+		}
+
+		// Reject tar entries with path traversal
+		if strings.Contains(hdr.Name, "..") {
+			continue
+		}
+
+		// Match the binary by base name — GoReleaser places it at the archive root
+		if filepath.Base(hdr.Name) != "confab" {
+			continue
+		}
+
+		// Write to temp file first for atomic replacement
+		tmpPath := destPath + ".tmp"
+		tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+
+		// Limit extraction size to prevent decompression bombs
+		const maxBinarySize = 100 * 1024 * 1024 // 100MB
+		_, copyErr := io.Copy(tmpFile, io.LimitReader(tr, maxBinarySize))
+		closeErr := tmpFile.Close()
+		if copyErr != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to write binary: %w", copyErr)
+		}
+		if closeErr != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to close temp file: %w", closeErr)
+		}
+
+		// Atomic rename
+		if err := os.Rename(tmpPath, destPath); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to install binary: %w", err)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("confab binary not found in archive")
+}
+
+// installLatestRelease downloads and installs the latest release.
+// Returns the path to the installed binary.
+func installLatestRelease() (string, error) {
+	release, err := fetchLatestRelease()
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch release info: %w", err)
+	}
+
+	assetURL, err := findAssetURL(release)
+	if err != nil {
+		return "", err
+	}
+
+	// Install to ~/.local/bin/confab
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	binDir := filepath.Join(homeDir, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create bin directory: %w", err)
+	}
+
+	destPath := filepath.Join(binDir, "confab")
+
+	fmt.Printf("Downloading %s...\n", release.TagName)
+	if err := downloadAndExtract(assetURL, destPath); err != nil {
+		return "", err
+	}
+
+	fmt.Printf("Installed to %s\n", destPath)
+	return destPath, nil
+}
+
+func init() {
+	rootCmd.AddCommand(updateCmd)
+	updateCmd.Flags().BoolVar(&checkOnly, "check", false, "only check for updates, don't install")
+}
+
+// AutoUpdateIfNeeded checks for updates and if available, downloads the new version
+// and re-execs into it with the same arguments. Only returns if no update is needed
+// or if update fails.
+func AutoUpdateIfNeeded() {
+	if !shouldCheckForUpdate() {
+		return
+	}
+
+	result, err := checkForUpdate()
+	if err != nil {
+		logger.Debug("Auto-update check failed: %v", err)
+		return
+	}
+
+	if !result.needsUpdate {
+		logger.Debug("No update needed (current=%s, latest=%s)", version, result.latest)
+		writeLastCheckTime()
+		return
+	}
+
+	logger.Info("Update available: %s -> %s", version, result.latest)
+	fmt.Fprintf(os.Stderr, "Updating confab (%s -> %s)...\n", version, result.latest)
+
+	// Download and install new version
+	newBinary, err := installLatestRelease()
+	if err != nil {
+		logger.Error("Auto-update failed: %v", err)
+		fmt.Fprintf(os.Stderr, "Auto-update failed: %v\n", err)
+		return
+	}
+
+	writeLastCheckTime()
+
+	// Re-exec into new binary with same arguments
+	fmt.Fprintf(os.Stderr, "Update complete, restarting...\n\n")
+	logger.Info("Re-execing into new binary: %s", newBinary)
+
+	if err := syscall.Exec(newBinary, os.Args, os.Environ()); err != nil {
+		logger.Error("Failed to exec new binary: %v", err)
+		fmt.Fprintf(os.Stderr, "Failed to restart: %v\n", err)
+	}
+}
+
+// shouldCheckForUpdate returns true if enough time has passed since last check
+func shouldCheckForUpdate() bool {
+	// Don't auto-update dev builds
+	if version == "dev" {
+		return false
+	}
+
+	// Respect user's auto-update preference
+	cfg, err := config.GetUploadConfig()
+	if err == nil && !cfg.IsAutoUpdateEnabled() {
+		return false
+	}
+
+	lastCheck := readLastCheckTime()
+	if lastCheck.IsZero() {
+		return true
+	}
+
+	// Check at most once per hour
+	return time.Since(lastCheck) > time.Hour
+}
+
+func getCheckTimePath() string {
+	// Use same directory as config in test environments
+	if testConfigPath := os.Getenv("CONFAB_CONFIG_PATH"); testConfigPath != "" {
+		return filepath.Join(filepath.Dir(testConfigPath), "last_update_check")
+	}
+	path, err := confabpath.Subpath("last_update_check")
+	if err != nil {
+		logger.Debug("Failed to get home directory for check time: %v", err)
+		return ""
+	}
+	return path
+}
+
+func readLastCheckTime() time.Time {
+	path := getCheckTimePath()
+	if path == "" {
+		return time.Time{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}
+	}
+
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+	if err != nil {
+		return time.Time{}
+	}
+
+	return t
+}
+
+func writeLastCheckTime() {
+	path := getCheckTimePath()
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		logger.Debug("Failed to create check time directory: %v", err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(time.Now().Format(time.RFC3339)), 0644); err != nil {
+		logger.Debug("Failed to write check time: %v", err)
+	}
+}
+
+// NotifyIfUpdateAvailable checks for updates and prints a notice if available.
+// Does not install - just informs the user.
+func NotifyIfUpdateAvailable() {
+	if !shouldCheckForUpdate() {
+		return
+	}
+
+	result, err := checkForUpdate()
+	if err != nil {
+		logger.Debug("Update check failed: %v", err)
+		return
+	}
+
+	writeLastCheckTime()
+
+	if !result.needsUpdate {
+		return
+	}
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "Update available: %s -> %s (run 'confab update' to install)\n", version, result.latest)
+}

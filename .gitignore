@@ -1,0 +1,28 @@
+# Binary
+confab
+confab.exe
+dist/
+/confab_*.tar.gz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Test artifacts
+*.test
+coverage.out
+test/e2e/confab-linux
+
+# Runtime
+*.log
+.confab/
+.claude/
+
+# Node
+node_modules/
+.kata.local.toml

@@ -1,0 +1,20 @@
+{
+  "name": "opencode-portable-windows",
+  "status": "completed",
+  "prd": "docs/prd/opencode-portable-windows.md",
+  "dependencies": [],
+  "slices": [
+    { "id": "plugin-binding", "status": "completed", "dependencies": [] },
+    { "id": "portable-package", "status": "completed", "dependencies": ["plugin-binding"] },
+    { "id": "silent-git-children", "status": "completed", "dependencies": ["portable-package"] }
+  ],
+  "validation_scope": "local_only",
+  "real_auth_verified": true,
+  "real_upload_verified": false,
+  "validation_report": ".trellis/tasks/opencode-portable-windows/validation.md",
+  "artifact": "dist/portable-no-console/confab_dev_windows_amd64.zip",
+  "live_sync_paused_by_user": true,
+  "live_runtime_upgraded": false,
+  "package_retest_report": ".trellis/tasks/opencode-portable-windows/package-retest-20260916.md",
+  "latest_real_auth_recheck": "http_timeout_tcp_reachable"
+}
