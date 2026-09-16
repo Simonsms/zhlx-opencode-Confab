@@ -98,8 +98,10 @@ func setupSetupTestEnv(t *testing.T) (tmpDir string, configPath string) {
 	t.Helper()
 	tmpDir = t.TempDir()
 
-	// Override HOME for paths
+	// Isolate both native Windows home paths and ambient XDG provider discovery.
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("USERPROFILE", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
 
 	// Create confab config directory
 	confabDir := filepath.Join(tmpDir, ".confab")
@@ -1042,6 +1044,13 @@ func resetSetupProviderName(t *testing.T) {
 }
 
 func TestRunSetup_AutoDetect_Both(t *testing.T) {
+	// A provider in the outer XDG profile must not leak into this isolated test.
+	ambientConfig := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ambientConfig, "opencode"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", ambientConfig)
+
 	backend := &setupTestBackend{validateValid: true}
 	server := httptest.NewServer(backend)
 	defer server.Close()
